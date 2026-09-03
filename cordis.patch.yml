@@ -1,0 +1,10 @@
+# dsh-android-use bundle layer: inserts the dsh-android-use plugin row.
+# Loaded by `dsh plugin --profile <name> add @huanlin/dsh-plugin-android-use`.
+# The `name` is the package entry; Loader resolves it from profile node_modules.
+# Defaults: adb from PATH, input mode 'input' (ASCII), no default serial.
+- insert:
+    - id: dsh-android-use
+      name: '@huanlin/dsh-plugin-android-use'
+      config:
+        adbPath: adb
+        inputTextMode: input

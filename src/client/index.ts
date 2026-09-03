@@ -1,0 +1,53 @@
+/**
+ * dsh-plugin-android-use — browser half.
+ *
+ * Single bundle, dual entry: this is the client half (exports `./client`).
+ * Host half ships via `.` (see `src/index.ts`).
+ *
+ * Registers two `tool.call.toolview` keyed slots:
+ *   - key `android_tap`        → TapCard (annotated pre-tap screenshot)
+ *   - key `android_screenshot` → ScreenshotCard (captured screenshot)
+ *
+ * `tool.call.toolview` is declared by `@deepseek-ai/dsh-client-ui-tool`, so
+ * both registrations go through `ctx.slots.inject` (waits on the declaration,
+ * leaves with this plugin's fiber). Durable image URLs resolve through the
+ * `uiConversation` service (v0.1.2: `conversation.resolveImage` is gone).
+ *
+ * @module @huanlin/dsh-plugin-android-use/client
+ */
+
+import type { Context } from '@deepseek-ai/cordis'
+// Type-only imports: pull the Context/SlotMap/StandardProps declaration
+// merges this plugin's compiled props depend on. Erased in the bundle.
+import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
+import type {} from '@deepseek-ai/dsh-client-ui-slots'
+import type {} from '@deepseek-ai/dsh-client-ui-tool/client'
+import type {} from '@deepseek-ai/dsh-client-ui-session/client'
+import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
+import { TapCard, type TapCardInjected } from './TapCard.tsx'
+import { ScreenshotCard, type ScreenshotCardInjected } from './ScreenshotCard.tsx'
+
+/** Required services: slot registry + Conversation image cache. */
+export const inject = ['slots', 'uiConversation']
+
+/**
+ * Client plugin body: register the `android_tap` and `android_screenshot` toolview slots.
+ * @param ctx - client root context.
+ */
+export function apply(ctx: Context): void {
+  const tapInjected = (): TapCardInjected => ({ uiConversation: ctx.uiConversation })
+  ctx.slots.inject('tool.call.toolview', () =>
+    ctx.slots.register({
+      name: 'tool.call.toolview',
+      key: 'android_tap',
+      inject: tapInjected,
+    }, TapCard))
+
+  const screenshotInjected = (): ScreenshotCardInjected => ({ uiConversation: ctx.uiConversation })
+  ctx.slots.inject('tool.call.toolview', () =>
+    ctx.slots.register({
+      name: 'tool.call.toolview',
+      key: 'android_screenshot',
+      inject: screenshotInjected,
+    }, ScreenshotCard))
+}

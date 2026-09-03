@@ -1,0 +1,148 @@
+/* TapCard toolview: a compact card showing the annotated pre-tap screenshot
+ * with tap coordinates and action metadata.
+ *
+ * Every color resolves through a --dsw-alias-* token (no literal colors). */
+
+.card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 8px;
+  background: var(--dsw-alias-bg-layer-1);
+  overflow: hidden;
+}
+
+/* ---- Header: title + action badge ---- */
+
+.header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.stateDot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--dsw-alias-label-caption);
+  transition: background 0.15s ease;
+}
+
+.card[data-state='running'] .stateDot {
+  background: var(--dsw-alias-brand-primary);
+  animation: dsh-android-tap-pulse 1.4s ease-in-out infinite;
+}
+
+.card[data-state='completed'] .stateDot {
+  background: var(--dsw-alias-state-success-primary);
+}
+
+.card[data-state='error'] .stateDot {
+  background: var(--dsw-alias-state-error-primary);
+}
+
+@keyframes dsh-android-tap-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+.title {
+  flex: 1 1 auto;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 20px;
+  color: var(--dsw-alias-label-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.badge {
+  flex: none;
+  font-size: 11px;
+  line-height: 18px;
+  padding: 0 6px;
+  border-radius: 4px;
+  background: var(--dsw-alias-bg-layer-2);
+  color: var(--dsw-alias-label-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- Screenshot images (pre-tap + post-tap grid) ---- */
+
+.imageGrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.imageSlot {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.imageLabel {
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--dsw-alias-label-tertiary);
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.imageWrap {
+  position: relative;
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--dsw-alias-bg-layer-2);
+  max-height: 280px;
+  display: flex;
+  justify-content: center;
+}
+
+.image {
+  display: block;
+  max-width: 100%;
+  max-height: 280px;
+  object-fit: contain;
+}
+
+.placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 80px;
+  font-size: 12px;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+/* ---- Footer: coordinates + metadata ---- */
+
+.meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--dsw-alias-label-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+.metaItem {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .card[data-state='running'] .stateDot {
+    animation: none;
+  }
+}
