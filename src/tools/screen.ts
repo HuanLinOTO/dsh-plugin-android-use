@@ -25,7 +25,8 @@ import type { ToolDeps } from '../registry.js'
 /** Canonical image metadata carried by `android_screenshot`. */
 export interface ScreenshotImage {
   attachmentId: string
-  mediaType: 'image/png'
+  /** Normalized media type from the attachment store (`saveImage` may re-encode, e.g. alpha PNG → WebP). */
+  mediaType: ImageAttachmentRef['mediaType']
   bytes: number
   width: number
   height: number
@@ -59,7 +60,7 @@ export interface UiDumpResult {
 function renderScreenshot(_args: unknown, value: unknown): ContentBlock[] {
   const v = value as ScreenshotResult
   const lines = [
-    `Screenshot captured: ${v.width}x${v.height} px, ${v.bytes} bytes (image/png).`,
+    `Screenshot captured: ${v.width}x${v.height} px, ${v.bytes} bytes (${v.image.mediaType}).`,
     `Device resolution: ${v.device_width}x${v.device_height}, scale: ${v.scale.toFixed(4)}.`,
     `Coordinates from android_ui_dump and android_tap use the ${v.width}x${v.height} image space.`,
     `Image emitted to model context: ${v.image_emitted ? 'yes' : 'no'}${v.image_emitted ? '' : ' (current route is not image-capable; use android_ui_dump for screen perception)'}.`,
@@ -68,7 +69,7 @@ function renderScreenshot(_args: unknown, value: unknown): ContentBlock[] {
   if (v.image_emitted) {
     const ref: ImageAttachmentRef = {
       attachmentId: v.image.attachmentId as unknown as ImageAttachmentRef['attachmentId'],
-      mediaType: 'image/png',
+      mediaType: v.image.mediaType,
       bytes: v.image.bytes,
       width: v.image.width,
       height: v.image.height,
@@ -173,7 +174,7 @@ export function registerScreenTools(ctx: Context, deps: ToolDeps): void {
             required: true,
             properties: {
               attachmentId: { type: 'string', required: true },
-              mediaType: { type: 'string', const: 'image/png', required: true },
+              mediaType: { type: 'string', required: true },
               bytes: { type: 'integer', required: true },
               width: { type: 'integer', required: true },
               height: { type: 'integer', required: true },
@@ -216,7 +217,7 @@ export function registerScreenTools(ctx: Context, deps: ToolDeps): void {
         scale,
         image: {
           attachmentId: ref.attachmentId as unknown as string,
-          mediaType: 'image/png',
+          mediaType: ref.mediaType,
           bytes: ref.bytes,
           width: ref.width,
           height: ref.height,

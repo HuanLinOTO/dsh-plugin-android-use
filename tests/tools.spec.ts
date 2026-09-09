@@ -275,6 +275,41 @@ describe('android_screenshot', () => {
     expect(store.saveImage).toHaveBeenCalledOnce()
   })
 
+  it('propagates the store-returned mediaType when normalization re-encodes to WebP', async () => {
+    const store = makeFakeStore()
+    store.saveImage = vi.fn(async () => ({
+      attachmentId: 'sha256:webpobject',
+      mediaType: 'image/webp',
+      bytes: 35772,
+      width: 2435,
+      height: 1721,
+    }))
+    const ctx = makeCtx({ attachments: store })
+    const pngBytes = await makePng(2435, 1721)
+    const adb = makeFakeAdb({
+      devicesValue: [{ serial: 'dev', state: 'device' }],
+      execOutBinaryFn: () => pngBytes,
+    })
+    registerTools(ctx, { adb, getConfig: () => defaultConfig })
+    const tool = getTool(ctx, 'android_screenshot')
+    const result = await tool.execute({}, { signal }) as {
+      image: { attachmentId: string; mediaType: string; bytes: number; width: number; height: number }
+      image_emitted: boolean
+    }
+    expect(result.image.mediaType).toBe('image/webp')
+    expect(result.image.attachmentId).toBe('sha256:webpobject')
+    // Render must rebuild the ref with the stored mediaType, never a hardcoded image/png,
+    // or readImage's probe fails with "Stored attachment metadata does not match its reference."
+    const blocks = tool.output.render({}, {
+      serial: 'dev', width: 2435, height: 1721, bytes: 35772,
+      device_width: 2435, device_height: 1721, scale: 1,
+      image: { attachmentId: 'sha256:webpobject', mediaType: 'image/webp', bytes: 35772, width: 2435, height: 1721 },
+      image_emitted: true,
+    }) as { type: string; attachment?: { mediaType: string } }[]
+    const imageBlock = blocks.find(b => b.type === 'image')
+    expect(imageBlock?.attachment?.mediaType).toBe('image/webp')
+  })
+
   it('scales screenshot and reports device dimensions when maxDimension < device resolution', async () => {
     const store = makeFakeStore()
     store.imageLimits = { ...store.imageLimits, maxImageDimension: 2000 }

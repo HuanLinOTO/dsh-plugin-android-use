@@ -24,6 +24,8 @@ import type { ToolDeps } from '../registry.js'
 /** Annotated screenshot attached to a tap result. */
 export interface TapScreenshot {
   attachmentId: string
+  /** Normalized media type from the attachment store (`saveImage` may re-encode, e.g. alpha PNG → WebP). */
+  mediaType: ImageAttachmentRef['mediaType']
   bytes: number
   width: number
   height: number
@@ -142,7 +144,7 @@ function renderTap(_args: unknown, value: unknown): ContentBlock[] {
         type: 'image',
         attachment: {
           attachmentId: v.pre_tap_screenshot.attachmentId as unknown as ImageAttachmentRef['attachmentId'],
-          mediaType: 'image/png',
+          mediaType: v.pre_tap_screenshot.mediaType ?? 'image/png',
           bytes: v.pre_tap_screenshot.bytes,
           width: v.pre_tap_screenshot.width,
           height: v.pre_tap_screenshot.height,
@@ -155,7 +157,7 @@ function renderTap(_args: unknown, value: unknown): ContentBlock[] {
         type: 'image',
         attachment: {
           attachmentId: v.post_tap_screenshot.attachmentId as unknown as ImageAttachmentRef['attachmentId'],
-          mediaType: 'image/png',
+          mediaType: v.post_tap_screenshot.mediaType ?? 'image/png',
           bytes: v.post_tap_screenshot.bytes,
           width: v.post_tap_screenshot.width,
           height: v.post_tap_screenshot.height,
@@ -239,6 +241,7 @@ export function registerInputTools(ctx: Context, deps: ToolDeps): void {
                 additionalProperties: false,
                 properties: {
                   attachmentId: { type: 'string', required: true },
+                  mediaType: { type: 'string', required: true },
                   bytes: { type: 'integer', required: true },
                   width: { type: 'integer', required: true },
                   height: { type: 'integer', required: true },
@@ -255,6 +258,7 @@ export function registerInputTools(ctx: Context, deps: ToolDeps): void {
                 additionalProperties: false,
                 properties: {
                   attachmentId: { type: 'string', required: true },
+                  mediaType: { type: 'string', required: true },
                   bytes: { type: 'integer', required: true },
                   width: { type: 'integer', required: true },
                   height: { type: 'integer', required: true },
@@ -300,6 +304,7 @@ export function registerInputTools(ctx: Context, deps: ToolDeps): void {
           })
           preScreenshot = {
             attachmentId: ref.attachmentId as unknown as string,
+            mediaType: ref.mediaType,
             bytes: ref.bytes,
             width: ref.width,
             height: ref.height,
@@ -335,6 +340,7 @@ export function registerInputTools(ctx: Context, deps: ToolDeps): void {
           })
           postScreenshot = {
             attachmentId: ref.attachmentId as unknown as string,
+            mediaType: ref.mediaType,
             bytes: ref.bytes,
             width: ref.width,
             height: ref.height,
