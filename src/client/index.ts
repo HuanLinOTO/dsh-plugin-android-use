@@ -11,7 +11,8 @@
  * `tool.call.toolview` is declared by `@deepseek-ai/dsh-client-ui-tool`, so
  * both registrations go through `ctx.slots.inject` (waits on the declaration,
  * leaves with this plugin's fiber). Durable image URLs resolve through the
- * `uiConversation` service (v0.1.2: `conversation.resolveImage` is gone).
+ * session-authorized `loadImage` loader the toolview owner supplies
+ * (v0.1.5: `ToolCallOwnerProps.loadImage` is required).
  *
  * @module @huanlin/dsh-plugin-android-use/client
  */
@@ -24,30 +25,26 @@ import type {} from '@deepseek-ai/dsh-client-ui-slots'
 import type {} from '@deepseek-ai/dsh-client-ui-tool/client'
 import type {} from '@deepseek-ai/dsh-client-ui-session/client'
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
-import { TapCard, type TapCardInjected } from './TapCard.tsx'
-import { ScreenshotCard, type ScreenshotCardInjected } from './ScreenshotCard.tsx'
+import { TapCard } from './TapCard.tsx'
+import { ScreenshotCard } from './ScreenshotCard.tsx'
 
-/** Required services: slot registry + Conversation image cache. */
-export const inject = ['slots', 'uiConversation']
+/** Required services: slot registry. */
+export const inject = ['slots']
 
 /**
  * Client plugin body: register the `android_tap` and `android_screenshot` toolview slots.
  * @param ctx - client root context.
  */
 export function apply(ctx: Context): void {
-  const tapInjected = (): TapCardInjected => ({ uiConversation: ctx.uiConversation })
   ctx.slots.inject('tool.call.toolview', () =>
     ctx.slots.register({
       name: 'tool.call.toolview',
       key: 'android_tap',
-      inject: tapInjected,
     }, TapCard))
 
-  const screenshotInjected = (): ScreenshotCardInjected => ({ uiConversation: ctx.uiConversation })
   ctx.slots.inject('tool.call.toolview', () =>
     ctx.slots.register({
       name: 'tool.call.toolview',
       key: 'android_screenshot',
-      inject: screenshotInjected,
     }, ScreenshotCard))
 }

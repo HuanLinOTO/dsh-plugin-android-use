@@ -4,26 +4,20 @@
  * Renders both the pre-tap screenshot (annotated with the tap marker) and
  * the post-tap screenshot (showing the result after tap) inline, along with
  * coordinates and action metadata. Images are loaded through the
- * `uiConversation.imageUrl` service, which converts the ImageAttachmentRef
- * into a session-authorized blob URL.
+ * session-authorized `loadImage` loader the toolview owner supplies, which
+ * converts the ImageAttachmentRef into a session-authorized blob URL.
  *
  * @module @huanlin/dsh-plugin-android-use/client/TapCard
  */
 
 import { useEffect, useState } from 'react'
 import type { ToolCallViewProps } from '@deepseek-ai/dsh-client-ui-tool/client'
-import type { InjectFace } from '@deepseek-ai/dsh-client-ui-slots'
-import type { ToolResultNode, UiConversation } from '@deepseek-ai/dsh-client-ui-conversation/client'
+import type { MessageImageLoader, ToolResultNode } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { ContentBlock, ImageBlock } from '@deepseek-ai/dsh-llm'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import css from './TapCard.module.css'
 
-/** Inject face: the Conversation image cache for durable URL resolution. */
-export type TapCardInjected = {
-  uiConversation: UiConversation
-}
-
-type TapCardProps = ToolCallViewProps & InjectFace<TapCardInjected>
+type TapCardProps = ToolCallViewProps
 
 /** Extract all image blocks from a settled tool result, in order. */
 function findImages(block: ToolResultNode): ImageBlock[] {
@@ -50,33 +44,32 @@ function parseTapArgs(argsRaw: string): { x?: number; y?: number } {
 }
 
 /**
- * Resolve an attachmentId to a browser URL through the uiConversation service.
- * Caches by attachmentId so re-renders don't re-fetch.
+ * Resolve an attachmentId to a browser URL through the session-authorized
+ * image loader. Caches by attachmentId so re-renders don't re-fetch.
  */
 function useImageUrl(
-  uiConversation: UiConversation,
-  sessionId: TapCardProps['sessionId'] | undefined,
+  loadImage: MessageImageLoader,
   attachment: ImageAttachmentRef | undefined,
 ): string | undefined {
   const [url, setUrl] = useState<string | undefined>(undefined)
   useEffect(() => {
-    if (attachment === undefined || sessionId === undefined) {
+    if (attachment === undefined) {
       setUrl(undefined)
       return
     }
     let cancelled = false
-    uiConversation.imageUrl(sessionId, attachment)
+    loadImage(attachment)
       .then((resolved) => { if (!cancelled) setUrl(resolved) })
       .catch(() => { if (!cancelled) setUrl(undefined) })
     return () => { cancelled = true }
-  }, [uiConversation, sessionId, attachment])
+  }, [loadImage, attachment])
   return url
 }
 
 /**
  * Render one `android_tap` tool call as a card with pre-tap and post-tap screenshots.
  */
-export function TapCard({ block, toolName, sessionId, uiConversation }: TapCardProps) {
+export function TapCard({ block, toolName, loadImage }: TapCardProps) {
   const settled = 'kind' in block ? block : undefined
   const running = 'kind' in block ? undefined : block
 
@@ -88,8 +81,8 @@ export function TapCard({ block, toolName, sessionId, uiConversation }: TapCardP
 
   const preImage = images[0]
   const postImage = images[1]
-  const preUrl = useImageUrl(uiConversation, sessionId, preImage?.attachment)
-  const postUrl = useImageUrl(uiConversation, sessionId, postImage?.attachment)
+  const preUrl = useImageUrl(loadImage, preImage?.attachment)
+  const postUrl = useImageUrl(loadImage, postImage?.attachment)
 
   const state = settled === undefined ? 'running' : (settled.isError ? 'error' : 'completed')
 
