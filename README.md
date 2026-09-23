@@ -29,6 +29,13 @@ dsh plugin --profile web add @huanlin/dsh-plugin-android-use
 | `adbPath` | string | `'adb'` | adb 可执行路径。默认从 PATH 查找。 |
 | `defaultSerial` | string? | - | 默认设备 serial。省略则单设备自动选择；多设备时模型需传 `serial` 参数。 |
 | `inputTextMode` | `'input' \| 'adbkeyboard'` | `'input'` | 文本输入模式。`input` 仅支持 ASCII（用 `adb shell input text`）；`adbkeyboard` 支持 Unicode（需设备安装 ADBKeyboard IME）。 |
+| `captureDir` | string? | `<系统临时目录>/dsh-android-use` | 每张发给模型的帧都会在此留一份，便于事后复查。 |
+| `captureKeep` | number | `200` | 留存上限，超出按时间删除最旧的；`0` 表示不清理。 |
+| `imageMaxDimension` | number | `1280` | 发给模型的图片长边上限（像素）：1080x2414 的截图会压到 573x1280。 |
+| `imageFormat` | `'jpeg' | 'webp' | 'png'` | `'jpeg'` | 发送编码。jpeg 体积最小，png 无损最大。 |
+| `imageQuality` | number | `80` | jpeg / webp 质量。 |
+| `showGrid` | boolean | `true` | 是否在发送的帧上绘制坐标网格。 |
+| `provideSkill` | boolean | `true` | 是否把插件自带 skill 注册到 `ctx.skills`（profile 未挂 skills 服务时自动跳过）。 |
 
 ## 工具
 
@@ -43,15 +50,15 @@ dsh plugin --profile web add @huanlin/dsh-plugin-android-use
 
 | 工具 | 参数 | 说明 |
 |------|------|------|
-| `android_screenshot` | `serial?` | 截屏并保存到 attachment store。仅当当前模型路由支持 image 输入时向模型发图；否则仅返回元数据（感知走 `android_ui_dump`）。 |
-| `android_ui_dump` | `serial?` | 转储 accessibility 树（UI 层级），返回节点列表（文本、bounds、center 坐标、交互标志）。**主要屏幕感知方式**——DeepSeek 无视觉能力时靠它理解屏幕。 |
+| `android_screenshot` | `region?`, `magnify?`, `serial?` | 截屏 → 裁剪/放大 → 压缩（默认长边 ≤1280、JPEG）→ 烧入坐标网格 → 留存本地 → 发图。`region` 用截图像素；省略 `magnify` 时自动放大到上限（≤4×）。返回 `saved_path`、设备分辨率、压缩比、网格步长。 |
+| `android_ui_dump` | `serial?` | 转储无障碍树，节点 `center` 即截图像素坐标。**App 未暴露无障碍节点时返回 `empty: true` 并明确建议改用截图**（不再静默返回 0 节点 + `screen 0x0`）。 |
 
 ### 输入操作
 
 | 工具 | 参数 | 说明 |
 |------|------|------|
-| `android_tap` | `x, y` (必填), `duration_ms?`, `times?` | 点击屏幕坐标。`duration_ms > 0` 为长按。 |
-| `android_swipe` | `x1, y1, x2, y2` (必填), `duration_ms?` | 从一点滑动到另一点。 |
+| `android_tap` | `x, y` (必填), `duration_ms?`, `times?` | 点击（坐标 = 截图像素 = 网格标签值）。返回 pre-tap（带落点标记）与 post-tap 两张网格帧。`duration_ms > 0` 为长按。 |
+| `android_swipe` | `x1, y1, x2, y2` (必填), `duration_ms?` | 滑动/滚动，坐标同上。列表滚动用它（**没有** `android_scroll`）。 |
 | `android_press_key` | `key` (必填, 命名或整数), `times?` | 按键。命名键：`home`/`back`/`app_switch`/`power`/`enter`/`volume_up` 等，或裸 keycode 整数。 |
 | `android_input_text` | `text` (必填), `submit?` | 在聚焦输入框中输入文本。`submit: true` 输入后按回车。 |
 
@@ -62,12 +69,44 @@ dsh plugin --profile web add @huanlin/dsh-plugin-android-use
 | `android_open_app` | `package` (必填), `activity?` | 打开应用。有 activity 用 `am start`；无 activity 用 `monkey` 启动默认 Activity。 |
 | `android_foreground_app` | `serial?` | 获取当前前台应用和 Activity（通过 `dumpsys window`）。 |
 
+## 坐标系与坐标网格
+
+所有坐标只有一个坐标系：**截图像素 = 设备像素 = 网格上打印的数字**。
+
+- `android_screenshot` 发回的图带坐标网格：顶部与右侧的深色刻度牌就是坐标值，读到 540 就直接 `android_tap({ x: 540, ... })`。
+- 图片经过压缩（默认长边 1280），**不要按像素比例估算坐标**，读网格标签即可。
+- `region` + `magnify` 用于放大确认小目标；放大图的标签仍是全图坐标，可直接用于点击。
+- `android_ui_dump` 的节点 `center` 同样落在这一坐标系，无需换算。
+
+## 截图留存
+
+每张发给模型的帧都会写到 `captureDir`（默认系统临时目录下的 `dsh-android-use/`），文件名形如 `20260919-161233-480-pre-tap.jpg`，超出 `captureKeep`（默认 200）自动清理最旧的。工具结果里的 `saved_path` 指向该文件，便于人工复现"模型当时看到了什么"。
+
+## 自带 skill（安装即生效，零文件操作）
+
+`skills/android-use/SKILL.md` 是插件自带的玩法说明（读网格、放大定位、dump 空树的回退、等待用户后必须重新截图等）。插件在 `apply()` 里把它作为 **runtime skill** 注册到 `ctx.skills`：
+
+```ts
+ctx.effect(() => ctx.skills.register({ name, description, content, source: 'runtime', resourceBase }))
+```
+
+因此**安装插件即可用**：不写 `postinstall`、不复制/链接任何文件到 `~/.agents/skills`、不依赖 `skill-filesystem`。名字、描述与正文在加载时从 `SKILL.md` 解析（该文件是唯一真相），注销随插件 fiber 一起回收。
+
+- profile 未挂载 skills 服务时自动跳过（工具照常可用，只是少了这份说明）。
+- 想改用文件系统版本（例如自行改 skill 文本）：把配置 `provideSkill` 设为 `false`，再把 `skills/android-use` 链接到 `~/.agents/skills/`：
+
+```powershell
+New-Item -ItemType Junction -Path "$env:USERPROFILE\.agents\skills\android-use" -Target "D:\Projects\deepseek-harness\dsh-plugin-android-use\skills\android-use"
+```
+
+> 两种方式同时存在会因同名冲突只生效一个（注册表会告警），按需二选一。
+
 ## 开发
 
 ```sh
 pnpm install          # 安装开发依赖（schemastery、typescript、vitest、tsdown）
 pnpm run typecheck    # tsc --noEmit 类型检查
-pnpm test             # vitest run 单元测试（132 用例）
+pnpm test             # vitest run 单元测试（含真实 ctx.skills 注册表集成用例）
 pnpm run build        # tsc + tsdown → lib/（index.js + client.js 双产物）
 ```
 
@@ -87,6 +126,7 @@ $src = "C:\Users\Administrator\.dsh\source\current"
   "dsh-client-ui-session"      = "$src\packages\client\ui-session"
   "dsh-client-ui-conversation" = "$src\packages\client\ui-conversation"
   "dsh-client-ui-renderer"     = "$src\packages\client\ui-renderer"
+  "dsh-skill"                  = "$src\packages\skill\skill"
 }.GetEnumerator() | ForEach-Object {
   New-Item -ItemType Junction -Path (Join-Path $nm $_.Key) -Target $_.Value | Out-Null
 }
@@ -107,7 +147,7 @@ $src = "C:\Users\Administrator\.dsh\source\current"
 - [x] C4: 工具返回规范 JSON 值 + render 投影分离
 - [x] C5: adb 缺失/设备离线等基础设施失败 throw；取消不 throw
 - [x] C6: 尊重 `exec.signal` 取消在途 adb 子进程
-- [x] G: Unit 测试（`tests/*.spec.ts`，132 用例，含真实 launcher dump fixture）
+- [x] G: Unit 测试（`tests/*.spec.ts`，含真实 launcher dump fixture；图像管线的尺寸/网格/裁剪断言在 `image.spec.ts`、`annotate.spec.ts`）
 
 ## 目录结构
 
@@ -116,6 +156,10 @@ dsh-plugin-android-use/
 ├── src/
 │   ├── index.ts           # 入口：name、inject、Config（Schemastery）、apply
 │   ├── adb.ts             # AdbClient: spawn 封装 + serial 解析 + 设备列表解析
+│   ├── frame.ts           # 截图管线：抓屏 → 裁剪/放大 → 压缩 → 网格标注 → 留存 → 发图
+│   ├── image.ts           # 裁剪/缩放/编码（sharp），坐标系换算
+│   ├── annotate.ts        # 坐标网格、落点/滑动标记、底部说明条（SVG composite）
+│   ├── capture.ts         # 留存目录写入与上限清理
 │   ├── xml.ts             # uiautomator XML 解析（零依赖）
 │   ├── keys.ts            # 命名按键表（home/back/app_switch/... → keycode）
 │   ├── registry.ts        # registerTools(ctx, deps) — 依赖注入入口

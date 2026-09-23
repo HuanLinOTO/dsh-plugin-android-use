@@ -1,10 +1,17 @@
 # dsh-android-use bundle layer: inserts the dsh-android-use plugin row.
 # Loaded by `dsh plugin --profile <name> add @huanlin/dsh-plugin-android-use`.
 # The `name` is the package entry; Loader resolves it from profile node_modules.
-# Defaults: adb from PATH, input mode 'input' (ASCII), no default serial.
+# Frames delivered to the model are cropped/magnified on request, compressed,
+# grid-annotated, and retained under (system temp)/dsh-android-use.
 - insert:
     - id: dsh-android-use
       name: '@huanlin/dsh-plugin-android-use'
       config:
         adbPath: adb
         inputTextMode: input
+        imageMaxDimension: 1280
+        imageFormat: jpeg
+        imageQuality: 80
+        showGrid: true
+        captureKeep: 200
+        provideSkill: true

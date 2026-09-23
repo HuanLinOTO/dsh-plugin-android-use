@@ -1,12 +1,11 @@
 /**
- * screen.ts — `android_screenshot` and `android_ui_dump` tools.
+ * screen.ts — android_screenshot and android_ui_dump.
  *
- * The screenshot tool follows `read_image`'s pattern: screencap → attachment
- * store → image block. Unlike `read_image`, it does NOT throw when the route
- * is not image-capable — the image is always saved to the attachment store
- * (for the UI card), but the image block is only emitted to the model when
- * the current route declares image input. When the route is unknown or
- * text-only, the model relies on `android_ui_dump` for screen perception.
+ * android_screenshot delivers a conditioned frame: cropped and magnified when
+ * asked, capped and compressed for the model, and ruler-annotated with a
+ * coordinate grid whose labels are screenshot pixels. android_ui_dump reads the
+ * accessibility tree and reports an empty tree explicitly instead of failing
+ * silently, because many apps draw their UI without accessibility nodes.
  *
  * @module @huanlin/dsh-plugin-android-use/src/tools/screen
  */
@@ -16,70 +15,103 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import { resolveSerial } from '../adb.js'
+import { parseWmSize } from './device.js'
 import { routeIsImageCapable } from '../route.js'
 import { parseUiDumpXml } from '../xml.js'
-import type { UiDump, UiNode } from '../xml.js'
-import { fitToMaxDimension, computeScale } from '../image.js'
+import type { UiNode } from '../xml.js'
+import { captureFrame, type Frame } from '../frame.js'
 import type { ToolDeps } from '../registry.js'
 
-/** Canonical image metadata carried by `android_screenshot`. */
-export interface ScreenshotImage {
-  attachmentId: string
-  /** Normalized media type from the attachment store (`saveImage` may re-encode, e.g. alpha PNG → WebP). */
-  mediaType: ImageAttachmentRef['mediaType']
-  bytes: number
-  width: number
-  height: number
-}
-
-/** Canonical result of `android_screenshot`. */
+/** Canonical result of android_screenshot. */
 export interface ScreenshotResult {
   serial: string
   width: number
   height: number
   bytes: number
+  media_type: string
   device_width: number
   device_height: number
   scale: number
-  image: ScreenshotImage
+  origin_x: number
+  origin_y: number
+  magnify: number
+  grid_step: number | null
+  saved_path: string | null
+  image: { attachmentId: string; mediaType: string; bytes: number; width: number; height: number } | null
   image_emitted: boolean
 }
 
-/** Canonical result of `android_ui_dump`. */
+/** Canonical result of android_ui_dump. */
 export interface UiDumpResult {
   serial: string
   screen_width: number
   screen_height: number
-  image_width: number
-  image_height: number
-  scale: number
   rotation: number
+  /** True when the foreground app exposed no accessibility nodes. */
+  empty: boolean
   nodes: UiNode[]
+}
+
+/** One-line explanation of the coordinate space shared by every android_* tool. */
+const COORDINATE_NOTE = 'Grid labels and node coordinates are screenshot pixels, which match device pixels: pass them to android_tap, android_swipe, and android_screenshot(region) unchanged.'
+
+function kib(bytes: number): string {
+  return `${Math.round(bytes / 1024)} KB`
+}
+
+function frameSummary(frame: Frame): string[] {
+  const lines = [
+    `Screenshot delivered: ${frame.width}x${frame.height} px (${frame.mediaType}, ${kib(frame.bytes)}).`,
+    `Device screenshot: ${frame.deviceWidth}x${frame.deviceHeight} px, scale ${frame.scale.toFixed(3)}.`,
+    COORDINATE_NOTE,
+  ]
+  lines.push(frame.gridStep === null
+    ? 'Grid: disabled (plugin config showGrid=false).'
+    : `Grid: lines every ${frame.gridStep} px on both axes, labelled with their screenshot coordinate.`)
+  if (frame.originX !== 0 || frame.originY !== 0 || frame.magnify !== 1) {
+    lines.push(`Region: origin (${frame.originX}, ${frame.originY}), magnified x${frame.magnify.toFixed(2)}.`)
+  }
+  lines.push(frame.savedPath === null
+    ? 'Retained copy: not written.'
+    : `Retained copy: ${frame.savedPath}`)
+  return lines
 }
 
 function renderScreenshot(_args: unknown, value: unknown): ContentBlock[] {
   const v = value as ScreenshotResult
-  const lines = [
-    `Screenshot captured: ${v.width}x${v.height} px, ${v.bytes} bytes (${v.image.mediaType}).`,
-    `Device resolution: ${v.device_width}x${v.device_height}, scale: ${v.scale.toFixed(4)}.`,
-    `Coordinates from android_ui_dump and android_tap use the ${v.width}x${v.height} image space.`,
-    `Image emitted to model context: ${v.image_emitted ? 'yes' : 'no'}${v.image_emitted ? '' : ' (current route is not image-capable; use android_ui_dump for screen perception)'}.`,
-  ]
+  const lines = frameSummary({
+    serial: v.serial,
+    width: v.width,
+    height: v.height,
+    bytes: v.bytes,
+    mediaType: v.media_type,
+    deviceWidth: v.device_width,
+    deviceHeight: v.device_height,
+    scale: v.scale,
+    image: v.image,
+    savedPath: v.saved_path,
+    originX: v.origin_x,
+    originY: v.origin_y,
+    magnify: v.magnify,
+    gridStep: v.grid_step,
+    note: null,
+  })
+  lines.push(v.image_emitted
+    ? 'Image emitted to model context: yes.'
+    : 'Image emitted to model context: no (the current route is not image-capable; the retained copy and the UI card still show it).')
   const text = lines.join('\n')
-  if (v.image_emitted) {
+  const blocks: ContentBlock[] = [{ type: 'text', text }]
+  if (v.image_emitted && v.image !== null) {
     const ref: ImageAttachmentRef = {
       attachmentId: v.image.attachmentId as unknown as ImageAttachmentRef['attachmentId'],
-      mediaType: v.image.mediaType,
+      mediaType: v.image.mediaType as ImageAttachmentRef['mediaType'],
       bytes: v.image.bytes,
       width: v.image.width,
       height: v.image.height,
     }
-    return [
-      { type: 'text', text },
-      { type: 'image', attachment: ref },
-    ]
+    blocks.push({ type: 'image', attachment: ref })
   }
-  return [{ type: 'text', text }]
+  return blocks
 }
 
 function nodeToTextLine(node: UiNode, index: number): string {
@@ -103,54 +135,56 @@ function nodeToTextLine(node: UiNode, index: number): string {
   return `  ${parts.join(' | ')}`
 }
 
-function scaleDump(dump: UiDump, scale: number): UiDump {
-  if (scale >= 1) return dump
-  const r = (n: number): number => Math.round(n * scale)
-  const nodes = dump.nodes.map(node => ({
-    ...node,
-    bounds: node.bounds !== null
-      ? { left: r(node.bounds.left), top: r(node.bounds.top), right: r(node.bounds.right), bottom: r(node.bounds.bottom) }
-      : null,
-    center: node.center !== null ? { x: r(node.center.x), y: r(node.center.y) } : null,
-  }))
-  return { rotation: dump.rotation, screen_width: dump.screen_width, screen_height: dump.screen_height, nodes }
-}
-
 function renderUiDump(_args: unknown, value: unknown): ContentBlock[] {
   const v = value as UiDumpResult
-  const total = v.nodes.length
   const interactive = v.nodes.filter(n =>
     n.text !== '' || n.content_desc !== '' || n.clickable || n.long_clickable || n.scrollable || n.focusable,
   )
-  const lines = [
-    `UI dump: ${total} nodes total (${interactive.length} interactive/text), screen ${v.screen_width}x${v.screen_height}, rotation ${v.rotation}.`,
-    `Coordinates are in screenshot image space (${v.image_width}x${v.image_height}, scale ${v.scale.toFixed(4)}). Use these center values directly with android_tap.`,
-    `Showing ${interactive.length} interactive/text nodes:`,
-  ]
+  const lines = [`UI dump: ${v.nodes.length} nodes (${interactive.length} interactive/text), screen ${v.screen_width}x${v.screen_height}, rotation ${v.rotation}.`]
+  if (v.empty) {
+    lines.push('The foreground app exposed no accessibility nodes, so this dump cannot guide a tap.')
+    lines.push('Do not retry android_ui_dump on this screen: call android_screenshot and read the coordinate grid instead. Zoom with android_screenshot(region, magnify) when the target is small.')
+    return [{ type: 'text', text: lines.join('\n') }]
+  }
+  lines.push(COORDINATE_NOTE)
+  lines.push(`Showing ${interactive.length} interactive/text nodes:`)
   let idx = 0
   for (const node of v.nodes) {
-    const isInteresting = node.text !== '' || node.content_desc !== '' || node.clickable || node.long_clickable || node.scrollable || node.focusable
-    if (!isInteresting) continue
+    const interesting = node.text !== '' || node.content_desc !== '' || node.clickable || node.long_clickable || node.scrollable || node.focusable
+    if (!interesting) continue
     lines.push(nodeToTextLine(node, idx))
     idx++
   }
   return [{ type: 'text', text: lines.join('\n') }]
 }
 
-/** Register `android_screenshot` and `android_ui_dump`. */
+/** Register android_screenshot and android_ui_dump. */
 export function registerScreenTools(ctx: Context, deps: ToolDeps): void {
   ctx.tools.register(defineTool({
     name: 'android_screenshot',
     description:
-      'Capture a screenshot from the Android device. The image may be scaled '
-      + 'to fit the attachment store pixel limit; the result includes device_width, '
-      + 'device_height, and scale so you know the mapping. Coordinates from '
-      + 'android_ui_dump and android_tap use the scaled image space. '
-      + 'The image is always saved to the attachment store (visible in the UI card). '
-      + 'The image is emitted to the model only when the current model route accepts '
-      + 'image input; otherwise, use android_ui_dump for text-based screen perception. '
-      + 'Pass "serial" to target a specific device.',
+      'Capture the Android screen and deliver it with a coordinate grid burned in. '
+      + 'Grid labels are screenshot pixels (= device pixels): read a label and pass that number to android_tap or android_swipe unchanged. '
+      + 'Pass region {x, y, width, height} to crop around a small target and magnify to zoom in (region + magnify is the reliable way to pin a tap point in a crowded list); the grid labels stay in full-screenshot coordinates. '
+      + 'The delivered image is capped and compressed for the model; the full-size device resolution and the delivered/delivered scale are always reported. '
+      + 'A copy is retained under the plugin capture directory and its path is returned. '
+      + 'Pass serial to target a specific device.',
     parameters: {
+      region: {
+        type: 'object',
+        additionalProperties: false,
+        description: 'Crop window in screenshot pixels, e.g. {x: 200, y: 800, width: 400, height: 300}.',
+        properties: {
+          x: { type: 'integer', required: true, description: 'Left edge in screenshot pixels.' },
+          y: { type: 'integer', required: true, description: 'Top edge in screenshot pixels.' },
+          width: { type: 'integer', required: true, description: 'Crop width in screenshot pixels.' },
+          height: { type: 'integer', required: true, description: 'Crop height in screenshot pixels.' },
+        },
+      },
+      magnify: {
+        type: 'number',
+        description: 'Zoom factor for a region crop (1-8). Omit to fill the size cap automatically (up to x4); ignored without region.',
+      },
       serial: {
         type: 'string',
         description: 'Device serial. Omit when only one device is attached; required when multiple are connected.',
@@ -165,20 +199,31 @@ export function registerScreenTools(ctx: Context, deps: ToolDeps): void {
           width: { type: 'integer', required: true },
           height: { type: 'integer', required: true },
           bytes: { type: 'integer', required: true },
+          media_type: { type: 'string', required: true },
           device_width: { type: 'integer', required: true },
           device_height: { type: 'integer', required: true },
           scale: { type: 'number', required: true },
+          origin_x: { type: 'integer', required: true },
+          origin_y: { type: 'integer', required: true },
+          magnify: { type: 'number', required: true },
+          grid_step: { oneOf: [{ type: 'null' }, { type: 'integer' }], required: true },
+          saved_path: { oneOf: [{ type: 'null' }, { type: 'string' }], required: true },
           image: {
-            type: 'object',
-            additionalProperties: false,
+            oneOf: [
+              { type: 'null' },
+              {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                  attachmentId: { type: 'string', required: true },
+                  mediaType: { type: 'string', required: true },
+                  bytes: { type: 'integer', required: true },
+                  width: { type: 'integer', required: true },
+                  height: { type: 'integer', required: true },
+                },
+              },
+            ],
             required: true,
-            properties: {
-              attachmentId: { type: 'string', required: true },
-              mediaType: { type: 'string', required: true },
-              bytes: { type: 'integer', required: true },
-              width: { type: 'integer', required: true },
-              height: { type: 'integer', required: true },
-            },
           },
           image_emitted: { type: 'boolean', required: true },
         },
@@ -186,42 +231,32 @@ export function registerScreenTools(ctx: Context, deps: ToolDeps): void {
       render: renderScreenshot,
     },
     async execute(args, exec) {
-      const a = args as { serial?: string }
+      const a = args as { region?: { x: number; y: number; width: number; height: number }; magnify?: number; serial?: string }
       const config = deps.getConfig()
       const { serial } = await resolveSerial(deps.adb, a.serial, config.defaultSerial, exec.signal)
-
-      const attachments = ctx.get('attachments') as import('@deepseek-ai/dsh-attachment').AttachmentStore | undefined
-      if (attachments === undefined) {
-        throw new Error('cannot capture screenshot: no attachment service is mounted')
-      }
-
-      const raw = await deps.adb.execOutBinary(serial, 'screencap -p', exec.signal)
-      const fitted = await fitToMaxDimension(new Uint8Array(raw), attachments.imageLimits.maxImageDimension)
-      const ref = await attachments.saveImage({
-        data: fitted.data,
-        mediaType: 'image/png',
-        name: 'screenshot.png',
+      const frame = await captureFrame(ctx, deps, {
+        serial,
+        kind: 'shot',
+        region: a.region,
+        magnify: a.magnify,
+        signal: exec.signal,
       })
-
-      const imageEmitted = await routeIsImageCapable(ctx, exec, exec.signal)
-
-      const scale = fitted.scaleX
-
+      const imageEmitted = frame.image !== null && await routeIsImageCapable(ctx, exec, exec.signal)
       return {
         serial,
-        width: ref.width,
-        height: ref.height,
-        bytes: ref.bytes,
-        device_width: Math.round(ref.width / fitted.scaleX),
-        device_height: Math.round(ref.height / fitted.scaleY),
-        scale,
-        image: {
-          attachmentId: ref.attachmentId as unknown as string,
-          mediaType: ref.mediaType,
-          bytes: ref.bytes,
-          width: ref.width,
-          height: ref.height,
-        },
+        width: frame.width,
+        height: frame.height,
+        bytes: frame.bytes,
+        media_type: frame.mediaType,
+        device_width: frame.deviceWidth,
+        device_height: frame.deviceHeight,
+        scale: frame.scale,
+        origin_x: frame.originX,
+        origin_y: frame.originY,
+        magnify: frame.magnify,
+        grid_step: frame.gridStep,
+        saved_path: frame.savedPath,
+        image: frame.image,
         image_emitted: imageEmitted,
       } satisfies ScreenshotResult
     },
@@ -230,12 +265,10 @@ export function registerScreenTools(ctx: Context, deps: ToolDeps): void {
   ctx.tools.register(defineTool({
     name: 'android_ui_dump',
     description:
-      'Dump the Android accessibility tree (UI hierarchy) as a structured node list. '
-      + 'Each node includes text, content description, resource-id, class, bounds, '
-      + 'center coordinates, and interaction flags (clickable, scrollable, etc.). '
-      + 'All coordinates are in screenshot image space (scaled to match the screenshot '
-      + 'from android_screenshot). Use node "center" values directly with android_tap. '
-      + 'Pass "serial" to target a specific device.',
+      'Dump the Android accessibility tree (UI hierarchy) as a structured node list: text, content description, resource-id, class, bounds, center, and interaction flags. '
+      + 'Node center values are screenshot pixels (= device pixels) and can be passed to android_tap unchanged. '
+      + 'Many apps (especially self-drawn super-apps) expose no accessibility nodes at all; when that happens the result says so explicitly and android_screenshot is the only remaining way to see the screen, so do not retry this tool on the same screen. '
+      + 'Pass serial to target a specific device.',
     parameters: {
       serial: {
         type: 'string',
@@ -250,10 +283,8 @@ export function registerScreenTools(ctx: Context, deps: ToolDeps): void {
           serial: { type: 'string', required: true },
           screen_width: { type: 'integer', required: true },
           screen_height: { type: 'integer', required: true },
-          image_width: { type: 'integer', required: true },
-          image_height: { type: 'integer', required: true },
-          scale: { type: 'number', required: true },
           rotation: { type: 'integer', required: true },
+          empty: { type: 'boolean', required: true },
           nodes: {
             type: 'array',
             items: {
@@ -317,24 +348,30 @@ export function registerScreenTools(ctx: Context, deps: ToolDeps): void {
       const { serial } = await resolveSerial(deps.adb, a.serial, config.defaultSerial, exec.signal)
 
       const dumpPath = `/sdcard/dsh_ui_dump_${Date.now()}.xml`
-      await deps.adb.shell(serial, `uiautomator dump ${dumpPath}`, exec.signal)
-      const xml = await deps.adb.execOut(serial, `cat ${dumpPath}`, exec.signal)
-      const dump: UiDump = parseUiDumpXml(xml)
+      // uiautomator prints a success banner even when it writes nothing, so the
+      // file size is the only honest signal that a dump happened.
+      const probe = await deps.adb.shell(serial, `uiautomator dump ${dumpPath} >/dev/null 2>&1; wc -c < ${dumpPath} 2>/dev/null || echo MISSING`, exec.signal)
+      const sizeMatch = /^\s*(\d+)\s*$/m.exec(probe)
+      const fileSize = sizeMatch !== null ? Number(sizeMatch[1]) : 0
+      const xml = fileSize > 0 ? await deps.adb.execOut(serial, `cat ${dumpPath}`, exec.signal) : ''
+      await deps.adb.shell(serial, `rm -f ${dumpPath}`, exec.signal)
 
-      const attachments = ctx.get('attachments') as import('@deepseek-ai/dsh-attachment').AttachmentStore | undefined
-      const maxDim = attachments?.imageLimits.maxImageDimension ?? Infinity
-      const scale = computeScale(dump.screen_width, dump.screen_height, maxDim)
-      const scaled = scaleDump(dump, scale)
+      const dump = parseUiDumpXml(xml)
+      let screenWidth = dump.screen_width
+      let screenHeight = dump.screen_height
+      if (screenWidth <= 0 || screenHeight <= 0) {
+        const size = parseWmSize(await deps.adb.shell(serial, 'wm size', exec.signal))
+        screenWidth = size.width
+        screenHeight = size.height
+      }
 
       return {
         serial,
-        screen_width: dump.screen_width,
-        screen_height: dump.screen_height,
-        image_width: Math.round(dump.screen_width * scale),
-        image_height: Math.round(dump.screen_height * scale),
-        scale,
+        screen_width: screenWidth,
+        screen_height: screenHeight,
         rotation: dump.rotation,
-        nodes: scaled.nodes,
+        empty: dump.nodes.length === 0,
+        nodes: dump.nodes,
       } satisfies UiDumpResult
     },
   }))

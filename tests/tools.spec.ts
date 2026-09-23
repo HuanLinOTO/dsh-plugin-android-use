@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { readFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
@@ -23,9 +24,18 @@ async function makePng(width: number, height: number): Promise<Buffer> {
   }).png().toBuffer()
 }
 
+const testCaptureDir = join(tmpdir(), 'dsh-android-use-vitest')
+
 const defaultConfig: ResolvedConfig = {
   defaultSerial: undefined,
   inputTextMode: 'input',
+  captureDir: testCaptureDir,
+  captureKeep: 20,
+  imageMaxDimension: 1280,
+  imageFormat: 'jpeg',
+  imageQuality: 80,
+  showGrid: true,
+  provideSkill: true,
 }
 
 interface FakeAdbBehaviors {
@@ -57,7 +67,7 @@ function makeFakeStore(): FakeStore {
       const meta = await sharp(input.data).metadata()
       return {
         attachmentId: 'sha256:fakeattachmentid',
-        mediaType: 'image/png',
+        mediaType: input.mediaType,
         bytes: input.data.byteLength,
         width: meta.width ?? 0,
         height: meta.height ?? 0,
@@ -246,7 +256,7 @@ describe('android_device_info', () => {
 })
 
 describe('android_screenshot', () => {
-  it('captures a screenshot and saves to attachment store', async () => {
+  it('captures, compresses, grid-annotates, and retains the frame', async () => {
     const store = makeFakeStore()
     const ctx = makeCtx({ attachments: store })
     const pngBytes = await makePng(1080, 2414)
@@ -257,22 +267,115 @@ describe('android_screenshot', () => {
     registerTools(ctx, { adb, getConfig: () => defaultConfig })
     const tool = getTool(ctx, 'android_screenshot')
     const result = await tool.execute({}, { signal }) as {
-      serial: string; width: number; height: number; bytes: number
+      serial: string; width: number; height: number; bytes: number; media_type: string
       device_width: number; device_height: number; scale: number
-      image: { attachmentId: string; mediaType: string; bytes: number; width: number; height: number }
+      origin_x: number; origin_y: number; magnify: number; grid_step: number | null
+      saved_path: string | null
+      image: { attachmentId: string; mediaType: string; bytes: number; width: number; height: number } | null
       image_emitted: boolean
     }
     expect(result.serial).toBe('dev')
-    expect(result.bytes).toBe(pngBytes.byteLength)
-    expect(result.width).toBe(1080)
-    expect(result.height).toBe(2414)
     expect(result.device_width).toBe(1080)
     expect(result.device_height).toBe(2414)
-    expect(result.scale).toBe(1)
-    expect(result.image.attachmentId).toBe('sha256:fakeattachmentid')
-    expect(result.image.mediaType).toBe('image/png')
+    // Longest side is capped at imageMaxDimension (1280): 1080x2414 -> 573x1280.
+    expect(result.width).toBe(573)
+    expect(result.height).toBe(1280)
+    expect(result.scale).toBeCloseTo(1280 / 2414, 3)
+    expect(result.media_type).toBe('image/jpeg')
+    expect(result.magnify).toBe(1)
+    expect(result.grid_step).not.toBeNull()
+    expect(result.saved_path).toContain('dsh-android-use-vitest')
     expect(result.image_emitted).toBe(false)
     expect(store.saveImage).toHaveBeenCalledOnce()
+    expect(store.saveImage.mock.calls[0]![0].mediaType).toBe('image/jpeg')
+  })
+
+  it('crops and magnifies a region while keeping screenshot-pixel grid labels', async () => {
+    const store = makeFakeStore()
+    const ctx = makeCtx({ attachments: store })
+    const pngBytes = await makePng(1080, 2414)
+    const adb = makeFakeAdb({
+      devicesValue: [{ serial: 'dev', state: 'device' }],
+      execOutBinaryFn: () => pngBytes,
+    })
+    registerTools(ctx, { adb, getConfig: () => defaultConfig })
+    const tool = getTool(ctx, 'android_screenshot')
+    const result = await tool.execute({ region: { x: 200, y: 800, width: 400, height: 300 }, magnify: 2 }, { signal }) as {
+      width: number; height: number; origin_x: number; origin_y: number; magnify: number
+      device_width: number; device_height: number; grid_step: number | null
+    }
+    expect(result.width).toBe(800)
+    expect(result.height).toBe(600)
+    expect(result.origin_x).toBe(200)
+    expect(result.origin_y).toBe(800)
+    expect(result.magnify).toBe(2)
+    expect(result.device_width).toBe(1080)
+    expect(result.device_height).toBe(2414)
+    // The step stays a screenshot-pixel value, so grid labels remain tap coordinates.
+    expect(result.grid_step).not.toBeNull()
+    expect(result.grid_step! % 50).toBe(0)
+  })
+
+  it('rejects a region that lies outside the screenshot', async () => {
+    const store = makeFakeStore()
+    const ctx = makeCtx({ attachments: store })
+    const pngBytes = await makePng(1080, 2414)
+    const adb = makeFakeAdb({
+      devicesValue: [{ serial: 'dev', state: 'device' }],
+      execOutBinaryFn: () => pngBytes,
+    })
+    registerTools(ctx, { adb, getConfig: () => defaultConfig })
+    const tool = getTool(ctx, 'android_screenshot')
+    await expect(tool.execute({ region: { x: 5000, y: 5000, width: 100, height: 100 } }, { signal })).rejects.toThrow()
+  })
+
+  it('honours a custom imageMaxDimension and format', async () => {
+    const store = makeFakeStore()
+    const ctx = makeCtx({ attachments: store })
+    const pngBytes = await makePng(1080, 2414)
+    const adb = makeFakeAdb({
+      devicesValue: [{ serial: 'dev', state: 'device' }],
+      execOutBinaryFn: () => pngBytes,
+    })
+    registerTools(ctx, { adb, getConfig: () => ({ ...defaultConfig, imageMaxDimension: 2000, imageFormat: 'png' }) })
+    const tool = getTool(ctx, 'android_screenshot')
+    const result = await tool.execute({}, { signal }) as { width: number; height: number; media_type: string }
+    expect(result.width).toBe(895)
+    expect(result.height).toBe(2000)
+    expect(result.media_type).toBe('image/png')
+  })
+
+  it('render returns only a text block when image_emitted is false', () => {
+    const ctx = makeCtx()
+    registerTools(ctx, { adb: makeFakeAdb(), getConfig: () => defaultConfig })
+    const tool = getTool(ctx, 'android_screenshot')
+    const blocks = tool.output.render({}, {
+      serial: 'dev', width: 573, height: 1280, bytes: 100, media_type: 'image/jpeg',
+      device_width: 1080, device_height: 2414, scale: 0.5302,
+      origin_x: 0, origin_y: 0, magnify: 1, grid_step: 200, saved_path: 'C:/tmp/shot.jpg',
+      image: { attachmentId: 'sha256:x', mediaType: 'image/jpeg', bytes: 100, width: 573, height: 1280 },
+      image_emitted: false,
+    })
+    expect(blocks).toHaveLength(1)
+    expect((blocks[0] as { type: string }).type).toBe('text')
+    expect((blocks[0] as { text: string }).text).toContain('Grid: lines every 200 px')
+    expect((blocks[0] as { text: string }).text).toContain('C:/tmp/shot.jpg')
+  })
+
+  it('render returns text + image block when image_emitted is true', () => {
+    const ctx = makeCtx()
+    registerTools(ctx, { adb: makeFakeAdb(), getConfig: () => defaultConfig })
+    const tool = getTool(ctx, 'android_screenshot')
+    const blocks = tool.output.render({}, {
+      serial: 'dev', width: 573, height: 1280, bytes: 100, media_type: 'image/jpeg',
+      device_width: 1080, device_height: 2414, scale: 0.5302,
+      origin_x: 0, origin_y: 0, magnify: 1, grid_step: 200, saved_path: null,
+      image: { attachmentId: 'sha256:x', mediaType: 'image/jpeg', bytes: 100, width: 573, height: 1280 },
+      image_emitted: true,
+    })
+    expect(blocks).toHaveLength(2)
+    expect((blocks[0] as { type: string }).type).toBe('text')
+    expect((blocks[1] as { type: string }).type).toBe('image')
   })
 
   it('propagates the store-returned mediaType when normalization re-encodes to WebP', async () => {
@@ -281,38 +384,9 @@ describe('android_screenshot', () => {
       attachmentId: 'sha256:webpobject',
       mediaType: 'image/webp',
       bytes: 35772,
-      width: 2435,
-      height: 1721,
+      width: 715,
+      height: 1598,
     }))
-    const ctx = makeCtx({ attachments: store })
-    const pngBytes = await makePng(2435, 1721)
-    const adb = makeFakeAdb({
-      devicesValue: [{ serial: 'dev', state: 'device' }],
-      execOutBinaryFn: () => pngBytes,
-    })
-    registerTools(ctx, { adb, getConfig: () => defaultConfig })
-    const tool = getTool(ctx, 'android_screenshot')
-    const result = await tool.execute({}, { signal }) as {
-      image: { attachmentId: string; mediaType: string; bytes: number; width: number; height: number }
-      image_emitted: boolean
-    }
-    expect(result.image.mediaType).toBe('image/webp')
-    expect(result.image.attachmentId).toBe('sha256:webpobject')
-    // Render must rebuild the ref with the stored mediaType, never a hardcoded image/png,
-    // or readImage's probe fails with "Stored attachment metadata does not match its reference."
-    const blocks = tool.output.render({}, {
-      serial: 'dev', width: 2435, height: 1721, bytes: 35772,
-      device_width: 2435, device_height: 1721, scale: 1,
-      image: { attachmentId: 'sha256:webpobject', mediaType: 'image/webp', bytes: 35772, width: 2435, height: 1721 },
-      image_emitted: true,
-    }) as { type: string; attachment?: { mediaType: string } }[]
-    const imageBlock = blocks.find(b => b.type === 'image')
-    expect(imageBlock?.attachment?.mediaType).toBe('image/webp')
-  })
-
-  it('scales screenshot and reports device dimensions when maxDimension < device resolution', async () => {
-    const store = makeFakeStore()
-    store.imageLimits = { ...store.imageLimits, maxImageDimension: 2000 }
     const ctx = makeCtx({ attachments: store })
     const pngBytes = await makePng(1080, 2414)
     const adb = makeFakeAdb({
@@ -322,111 +396,100 @@ describe('android_screenshot', () => {
     registerTools(ctx, { adb, getConfig: () => defaultConfig })
     const tool = getTool(ctx, 'android_screenshot')
     const result = await tool.execute({}, { signal }) as {
-      width: number; height: number; device_width: number; device_height: number; scale: number
+      image: { attachmentId: string; mediaType: string; bytes: number; width: number; height: number } | null
+      image_emitted: boolean
     }
-    expect(result.width).toBe(895)
-    expect(result.height).toBe(2000)
-    expect(result.device_width).toBe(1080)
-    expect(result.device_height).toBe(2414)
-    expect(result.scale).toBeCloseTo(895 / 1080, 3)
-  })
-
-  it('render returns only a text block when image_emitted is false', () => {
-    const ctx = makeCtx()
-    const adb = makeFakeAdb()
-    registerTools(ctx, { adb, getConfig: () => defaultConfig })
-    const tool = getTool(ctx, 'android_screenshot')
+    expect(result.image!.mediaType).toBe('image/webp')
+    expect(result.image!.attachmentId).toBe('sha256:webpobject')
+    // Render must rebuild the ref with the stored mediaType, never a hardcoded one,
+    // or readImage's probe fails with 'Stored attachment metadata does not match its reference.'
     const blocks = tool.output.render({}, {
-      serial: 'dev', width: 1080, height: 2414, bytes: 100,
-      device_width: 1080, device_height: 2414, scale: 1,
-      image: { attachmentId: 'sha256:x', mediaType: 'image/png', bytes: 100, width: 1080, height: 2414 },
-      image_emitted: false,
-    })
-    expect(blocks).toHaveLength(1)
-    expect((blocks[0] as { type: string }).type).toBe('text')
-  })
-
-  it('render returns text + image block when image_emitted is true', () => {
-    const ctx = makeCtx()
-    const adb = makeFakeAdb()
-    registerTools(ctx, { adb, getConfig: () => defaultConfig })
-    const tool = getTool(ctx, 'android_screenshot')
-    const blocks = tool.output.render({}, {
-      serial: 'dev', width: 1080, height: 2414, bytes: 100,
-      device_width: 1080, device_height: 2414, scale: 1,
-      image: { attachmentId: 'sha256:x', mediaType: 'image/png', bytes: 100, width: 1080, height: 2414 },
+      serial: 'dev', width: 715, height: 1598, bytes: 35772, media_type: 'image/webp',
+      device_width: 1080, device_height: 2414, scale: 0.6620,
+      origin_x: 0, origin_y: 0, magnify: 1, grid_step: 200, saved_path: null,
+      image: { attachmentId: 'sha256:webpobject', mediaType: 'image/webp', bytes: 35772, width: 715, height: 1598 },
       image_emitted: true,
-    })
-    expect(blocks).toHaveLength(2)
-    expect((blocks[0] as { type: string }).type).toBe('text')
-    expect((blocks[1] as { type: string }).type).toBe('image')
+    }) as { type: string; attachment?: { mediaType: string } }[]
+    const imageBlock = blocks.find(b => b.type === 'image')
+    expect(imageBlock?.attachment?.mediaType).toBe('image/webp')
   })
 
-  it('throws when no attachment service is mounted', async () => {
+  it('delivers and retains a frame even without an attachment store', async () => {
     const ctx = makeCtx()
+    const pngBytes = await makePng(1080, 2414)
     const adb = makeFakeAdb({
       devicesValue: [{ serial: 'dev', state: 'device' }],
+      execOutBinaryFn: () => pngBytes,
     })
     registerTools(ctx, { adb, getConfig: () => defaultConfig })
     const tool = getTool(ctx, 'android_screenshot')
-    await expect(tool.execute({}, { signal })).rejects.toThrow('no attachment service')
+    const result = await tool.execute({}, { signal }) as { image: unknown; saved_path: string | null; image_emitted: boolean }
+    expect(result.image).toBeNull()
+    expect(result.saved_path).toContain('dsh-android-use-vitest')
+    expect(result.image_emitted).toBe(false)
   })
 })
 
 describe('android_ui_dump', () => {
-  it('dumps and parses the accessibility tree', async () => {
+  it('dumps and parses the accessibility tree in screenshot pixels', async () => {
     const ctx = makeCtx()
     const adb = makeFakeAdb({
       devicesValue: [{ serial: 'dev', state: 'device' }],
-      shellFn: () => 'UI hierchary dumped to: /sdcard/dsh_ui_dump.xml',
+      shellFn: (_s, cmd) => cmd.includes('wc -c') ? '48213' : '',
       execOutFn: () => fixtureXml,
     })
     registerTools(ctx, { adb, getConfig: () => defaultConfig })
     const tool = getTool(ctx, 'android_ui_dump')
     const result = await tool.execute({}, { signal }) as {
-      serial: string; screen_width: number; screen_height: number
-      image_width: number; image_height: number; scale: number
-      rotation: number; nodes: unknown[]
+      serial: string; screen_width: number; screen_height: number; rotation: number
+      empty: boolean; nodes: { center: { x: number; y: number } | null }[]
     }
     expect(result.serial).toBe('dev')
     expect(result.screen_width).toBe(1080)
     expect(result.screen_height).toBe(2414)
-    expect(result.image_width).toBe(1080)
-    expect(result.image_height).toBe(2414)
-    expect(result.scale).toBe(1)
     expect(result.rotation).toBe(0)
+    expect(result.empty).toBe(false)
     expect(result.nodes).toHaveLength(44)
+    const nodeWithCenter = result.nodes.find(n => n.center !== null)
+    expect(nodeWithCenter!.center!.x).toBeLessThanOrEqual(1080)
+    expect(nodeWithCenter!.center!.y).toBeLessThanOrEqual(2414)
   })
 
-  it('scales node coordinates to image space when attachment store limits resolution', async () => {
-    const store = makeFakeStore()
-    store.imageLimits = { ...store.imageLimits, maxImageDimension: 2000 }
-    const ctx = makeCtx({ attachments: store })
+  it('removes the temporary dump file from the device', async () => {
+    const calls: string[] = []
+    const ctx = makeCtx()
     const adb = makeFakeAdb({
       devicesValue: [{ serial: 'dev', state: 'device' }],
-      shellFn: () => 'UI hierchary dumped to: /sdcard/dsh_ui_dump.xml',
+      shellFn: (_s, cmd) => { calls.push(cmd); return cmd.includes('wc -c') ? '48213' : '' },
       execOutFn: () => fixtureXml,
     })
     registerTools(ctx, { adb, getConfig: () => defaultConfig })
-    const tool = getTool(ctx, 'android_ui_dump')
-    const result = await tool.execute({}, { signal }) as {
-      screen_width: number; screen_height: number
-      image_width: number; image_height: number; scale: number
-      nodes: { center: { x: number; y: number } | null }[]
-    }
-    expect(result.screen_width).toBe(1080)
-    expect(result.screen_height).toBe(2414)
-    expect(result.image_width).toBe(895)
-    expect(result.image_height).toBe(2000)
-    expect(result.scale).toBeCloseTo(2000 / 2414, 3)
-    // Nodes should have scaled centers
-    const nodeWithCenter = result.nodes.find(n => n.center !== null)
-    expect(nodeWithCenter).toBeDefined()
-    // Scale factor ≈ 0.8285, so centers should be smaller than device coords
-    expect(nodeWithCenter!.center!.x).toBeLessThan(1080)
-    expect(nodeWithCenter!.center!.y).toBeLessThan(2414)
+    await getTool(ctx, 'android_ui_dump').execute({}, { signal })
+    expect(calls.some(c => c.startsWith('rm -f /sdcard/dsh_ui_dump_'))).toBe(true)
   })
 
+  it('reports an empty tree with the real screen size instead of failing silently', async () => {
+    const ctx = makeCtx()
+    const adb = makeFakeAdb({
+      devicesValue: [{ serial: 'dev', state: 'device' }],
+      shellFn: (_s, cmd) => {
+        if (cmd.includes('wc -c')) return 'MISSING'
+        if (cmd === 'wm size') return 'Physical size: 1240x2772' + String.fromCharCode(10) + 'Override size: 1080x2414' + String.fromCharCode(10)
+        return ''
+      },
+    })
+    registerTools(ctx, { adb, getConfig: () => defaultConfig })
+    const tool = getTool(ctx, 'android_ui_dump')
+    const result = await tool.execute({}, { signal }) as { empty: boolean; screen_width: number; screen_height: number; nodes: unknown[] }
+    expect(result.empty).toBe(true)
+    expect(result.nodes).toHaveLength(0)
+    expect(result.screen_width).toBe(1080)
+    expect(result.screen_height).toBe(2414)
+    const blocks = tool.output.render({}, result)
+    const text = (blocks[0] as { text: string }).text
+    expect(text).toContain('exposed no accessibility nodes')
+    expect(text).toContain('android_screenshot')
+  })
   it('render produces text with node count and interactive summary', () => {
     const ctx = makeCtx()
     const adb = makeFakeAdb()
@@ -442,7 +505,7 @@ describe('android_ui_dump', () => {
     })
     expect(blocks).toHaveLength(1)
     const text = (blocks[0] as { text: string }).text
-    expect(text).toContain('2 nodes total')
+    expect(text).toContain('2 nodes (1 interactive/text)')
     expect(text).toContain('1 interactive')
     expect(text).toContain('Settings')
     expect(text).not.toContain('FrameLayout')
@@ -504,7 +567,7 @@ describe('android_tap', () => {
     expect(shellCalls.filter(c => c.includes('input tap 10 20'))).toHaveLength(3)
   })
 
-  it('captures both pre-tap and post-tap screenshots when attachment store is available', async () => {
+  it('captures compressed pre-tap and post-tap frames with the tap marker', async () => {
     const store = makeFakeStore()
     const ctx = makeCtx({ attachments: store })
     const pngBytes = await makePng(1080, 2414)
@@ -519,17 +582,17 @@ describe('android_tap', () => {
     const result = await tool.execute({ x: 540, y: 1207 }, { signal }) as {
       pre_tap_screenshot: { attachmentId: string; width: number; height: number; bytes: number } | null
       post_tap_screenshot: { attachmentId: string; width: number; height: number; bytes: number } | null
+      pre_saved_path: string | null
+      post_saved_path: string | null
       screenshot_emitted: boolean
       device_x: number; device_y: number
     }
     expect(result.pre_tap_screenshot).not.toBeNull()
-    expect(result.pre_tap_screenshot!.attachmentId).toBe('sha256:fakeattachmentid')
-    expect(result.pre_tap_screenshot!.width).toBe(1080)
-    expect(result.pre_tap_screenshot!.height).toBe(2414)
     expect(result.post_tap_screenshot).not.toBeNull()
-    expect(result.post_tap_screenshot!.attachmentId).toBe('sha256:fakeattachmentid')
-    expect(result.post_tap_screenshot!.width).toBe(1080)
-    expect(result.post_tap_screenshot!.height).toBe(2414)
+    expect(result.pre_tap_screenshot!.width).toBe(573)
+    expect(result.pre_tap_screenshot!.height).toBe(1280)
+    expect(result.pre_saved_path).toContain('pre-tap')
+    expect(result.post_saved_path).toContain('post-tap')
     expect(result.screenshot_emitted).toBe(false)
     expect(result.device_x).toBe(540)
     expect(result.device_y).toBe(1207)
@@ -537,9 +600,8 @@ describe('android_tap', () => {
     expect(shellCalls).toContain('input tap 540 1207')
   })
 
-  it('converts image-space tap coordinates to device-space when screenshot is scaled', async () => {
+  it('taps the requested screenshot pixel whatever the delivered image scale is', async () => {
     const store = makeFakeStore()
-    store.imageLimits = { ...store.imageLimits, maxImageDimension: 2000 }
     const ctx = makeCtx({ attachments: store })
     const pngBytes = await makePng(1080, 2414)
     const shellCalls: string[] = []
@@ -548,26 +610,18 @@ describe('android_tap', () => {
       shellFn: (_s, cmd) => { shellCalls.push(cmd); return '' },
       execOutBinaryFn: () => pngBytes,
     })
-    registerTools(ctx, { adb, getConfig: () => defaultConfig })
+    registerTools(ctx, { adb, getConfig: () => ({ ...defaultConfig, imageMaxDimension: 400 }) })
     const tool = getTool(ctx, 'android_tap')
-    // Model sees a 895x2000 image and picks center (447, 1000)
-    const result = await tool.execute({ x: 447, y: 1000 }, { signal }) as {
+    const result = await tool.execute({ x: 540, y: 1207 }, { signal }) as {
       device_x: number; device_y: number
       pre_tap_screenshot: { width: number; height: number } | null
-      post_tap_screenshot: { width: number; height: number } | null
     }
-    // Plugin converts back to device coords: 447/(895/1080)≈539, 1000/(2000/2414)≈1207
-    expect(result.device_x).toBe(539)
+    // The delivered frame is scaled hard, yet the tap still targets screenshot pixel (540, 1207).
+    expect(result.pre_tap_screenshot!.height).toBeLessThanOrEqual(400)
+    expect(result.device_x).toBe(540)
     expect(result.device_y).toBe(1207)
-    expect(result.pre_tap_screenshot).not.toBeNull()
-    expect(result.pre_tap_screenshot!.width).toBe(895)
-    expect(result.pre_tap_screenshot!.height).toBe(2000)
-    expect(result.post_tap_screenshot).not.toBeNull()
-    expect(result.post_tap_screenshot!.width).toBe(895)
-    expect(result.post_tap_screenshot!.height).toBe(2000)
-    expect(shellCalls).toContain('input tap 539 1207')
+    expect(shellCalls).toContain('input tap 540 1207')
   })
-
   it('still performs the tap when screenshot capture fails', async () => {
     const store = makeFakeStore()
     const ctx = makeCtx({ attachments: store })
@@ -596,7 +650,7 @@ describe('android_tap', () => {
     const tool = getTool(ctx, 'android_tap')
     const blocks = tool.output.render({}, {
       serial: 'dev', x: 100, y: 200, device_x: 100, device_y: 200, duration_ms: 0, times: 1, action: 'tap',
-      pre_tap_screenshot: null, post_tap_screenshot: null, screenshot_emitted: false,
+      pre_tap_screenshot: null, post_tap_screenshot: null, pre_saved_path: null, post_saved_path: null, screenshot_emitted: false,
     })
     expect(blocks).toHaveLength(1)
     expect((blocks[0] as { type: string }).type).toBe('text')
@@ -608,8 +662,9 @@ describe('android_tap', () => {
     const tool = getTool(ctx, 'android_tap')
     const blocks = tool.output.render({}, {
       serial: 'dev', x: 100, y: 200, device_x: 100, device_y: 200, duration_ms: 0, times: 1, action: 'tap',
-      pre_tap_screenshot: { attachmentId: 'sha256:x', bytes: 100, width: 1080, height: 2414 },
-      post_tap_screenshot: { attachmentId: 'sha256:y', bytes: 100, width: 1080, height: 2414 },
+      pre_tap_screenshot: { attachmentId: 'sha256:x', mediaType: 'image/jpeg', bytes: 100, width: 573, height: 1280 },
+      post_tap_screenshot: { attachmentId: 'sha256:y', mediaType: 'image/jpeg', bytes: 100, width: 573, height: 1280 },
+      pre_saved_path: 'C:/tmp/pre-tap.jpg', post_saved_path: 'C:/tmp/post-tap.jpg',
       screenshot_emitted: false,
     })
     expect(blocks).toHaveLength(1)
@@ -623,8 +678,9 @@ describe('android_tap', () => {
     const tool = getTool(ctx, 'android_tap')
     const blocks = tool.output.render({}, {
       serial: 'dev', x: 100, y: 200, device_x: 100, device_y: 200, duration_ms: 0, times: 1, action: 'tap',
-      pre_tap_screenshot: { attachmentId: 'sha256:x', bytes: 100, width: 1080, height: 2414 },
-      post_tap_screenshot: { attachmentId: 'sha256:y', bytes: 100, width: 1080, height: 2414 },
+      pre_tap_screenshot: { attachmentId: 'sha256:x', mediaType: 'image/jpeg', bytes: 100, width: 573, height: 1280 },
+      post_tap_screenshot: { attachmentId: 'sha256:y', mediaType: 'image/jpeg', bytes: 100, width: 573, height: 1280 },
+      pre_saved_path: null, post_saved_path: null,
       screenshot_emitted: true,
     })
     // 1 text summary + 1 text label + 1 image + 1 text label + 1 image = 5
@@ -671,33 +727,25 @@ describe('android_swipe', () => {
     expect(shellCalls.some(c => c.includes('300'))).toBe(true)
   })
 
-  it('converts image-space swipe coordinates to device-space when attachment store limits resolution', async () => {
-    const store = makeFakeStore()
-    store.imageLimits = { ...store.imageLimits, maxImageDimension: 2000 }
-    const ctx = makeCtx({ attachments: store })
+  it('passes screenshot-pixel coordinates to input swipe unchanged', async () => {
+    const ctx = makeCtx()
     const shellCalls: string[] = []
     const adb = makeFakeAdb({
       devicesValue: [{ serial: 'dev', state: 'device' }],
-      shellFn: (_s, cmd) => {
-        shellCalls.push(cmd)
-        if (cmd === 'wm size') return 'Physical size: 1080x2414\n'
-        return ''
-      },
+      shellFn: (_s, cmd) => { shellCalls.push(cmd); return '' },
     })
     registerTools(ctx, { adb, getConfig: () => defaultConfig })
     const tool = getTool(ctx, 'android_swipe')
-    const result = await tool.execute({ x1: 100, y1: 200, x2: 300, y2: 400, duration_ms: 500 }, { signal }) as {
+    const result = await tool.execute({ x1: 540, y1: 1800, x2: 540, y2: 900, duration_ms: 400 }, { signal }) as {
       device_x1: number; device_y1: number; device_x2: number; device_y2: number
     }
-    // scale = 2000/2414 ≈ 0.8285
-    expect(result.device_x1).toBe(121)
-    expect(result.device_y1).toBe(241)
-    expect(result.device_x2).toBe(362)
-    expect(result.device_y2).toBe(483)
-    expect(shellCalls.some(c => c.includes('input swipe 121 241 362 483 500'))).toBe(true)
+    expect(result.device_x1).toBe(540)
+    expect(result.device_y1).toBe(1800)
+    expect(result.device_x2).toBe(540)
+    expect(result.device_y2).toBe(900)
+    expect(shellCalls.some(c => c.includes('input swipe 540 1800 540 900 400'))).toBe(true)
   })
 })
-
 describe('android_press_key', () => {
   it('resolves named key to keycode', async () => {
     const ctx = makeCtx()
@@ -784,7 +832,7 @@ describe('android_input_text', () => {
       devicesValue: [{ serial: 'dev', state: 'device' }],
       shellFn: (_s, cmd) => { shellCalls.push(cmd); return '' },
     })
-    registerTools(ctx, { adb, getConfig: () => ({ defaultSerial: undefined, inputTextMode: 'adbkeyboard' }) })
+    registerTools(ctx, { adb, getConfig: () => ({ ...defaultConfig, inputTextMode: 'adbkeyboard' }) })
     const tool = getTool(ctx, 'android_input_text')
     const result = await tool.execute({ text: '你好' }, { signal }) as { mode: string }
     expect(result.mode).toBe('adbkeyboard')

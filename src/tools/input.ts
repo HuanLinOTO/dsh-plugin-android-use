@@ -1,10 +1,10 @@
 /**
- * input.ts — `android_tap`, `android_swipe`, `android_press_key`, `android_input_text` tools.
+ * input.ts — android_tap, android_swipe, android_press_key, android_input_text.
  *
- * `android_tap` captures a pre-tap screenshot, annotates it with a marker at
- * the tap coordinates, saves it to the attachment store, and renders it as
- * the tool-call result so the model (and the UI) can visually verify where
- * the tap landed.
+ * Tap and swipe take screenshot pixels (device pixels) — the numbers printed on
+ * the coordinate grid of an android_screenshot frame. Tap captures a marked
+ * pre-tap frame and an unmarked post-tap frame, both grid-annotated, compressed,
+ * and retained on disk.
  *
  * @module @huanlin/dsh-plugin-android-use/src/tools/input
  */
@@ -14,24 +14,21 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import { resolveSerial } from '../adb.js'
-import { parseWmSize } from '../adb.js'
 import { routeIsImageCapable } from '../route.js'
-import { annotateTap } from '../annotate.js'
-import { fitToMaxDimension, computeScale } from '../image.js'
+import { captureFrame, type Frame } from '../frame.js'
 import { resolveKey } from '../keys.js'
 import type { ToolDeps } from '../registry.js'
 
-/** Annotated screenshot attached to a tap result. */
+/** A frame reference carried by a tap result. */
 export interface TapScreenshot {
   attachmentId: string
-  /** Normalized media type from the attachment store (`saveImage` may re-encode, e.g. alpha PNG → WebP). */
-  mediaType: ImageAttachmentRef['mediaType']
+  mediaType: string
   bytes: number
   width: number
   height: number
 }
 
-/** Canonical result of `android_tap`. */
+/** Canonical result of android_tap. */
 export interface TapResult {
   serial: string
   x: number
@@ -43,10 +40,14 @@ export interface TapResult {
   action: 'tap' | 'long_press'
   pre_tap_screenshot: TapScreenshot | null
   post_tap_screenshot: TapScreenshot | null
+  /** Retained copy of the pre-tap frame, or null. */
+  pre_saved_path: string | null
+  /** Retained copy of the post-tap frame, or null. */
+  post_saved_path: string | null
   screenshot_emitted: boolean
 }
 
-/** Canonical result of `android_swipe`. */
+/** Canonical result of android_swipe. */
 export interface SwipeResult {
   serial: string
   x1: number
@@ -60,7 +61,7 @@ export interface SwipeResult {
   duration_ms: number
 }
 
-/** Canonical result of `android_press_key`. */
+/** Canonical result of android_press_key. */
 export interface PressKeyResult {
   serial: string
   key: string
@@ -68,7 +69,7 @@ export interface PressKeyResult {
   times: number
 }
 
-/** Canonical result of `android_input_text`. */
+/** Canonical result of android_input_text. */
 export interface InputTextResult {
   serial: string
   text: string
@@ -96,7 +97,7 @@ export function escapeInputText(text: string): string {
     switch (ch) {
       case ' ': out += '%s'; break
       case '&': case '<': case '>': case ';': case '(': case ')':
-      case '|': case '^': case '*': case '~': case '"': case '\'':
+      case '|': case '^': case '*': case '~': case '"': case "'":
       case '`': case '$': case '!': case '#':
         out += '\\' + ch
         break
@@ -116,67 +117,63 @@ export function encodeAdbKeyboard(text: string): string {
   return encodeURIComponent(text)
 }
 
+function kib(bytes: number): string {
+  return `${Math.round(bytes / 1024)} KB`
+}
+
+function frameLine(label: string, image: TapScreenshot | null, savedPath: string | null): string {
+  if (image === null) return `${label}: not captured.`
+  const where = savedPath === null ? 'not retained' : savedPath
+  return `${label}: ${image.width}x${image.height} px (${image.mediaType}, ${kib(image.bytes)}), retained at ${where}.`
+}
+
+function toRef(image: Frame['image']): TapScreenshot | null {
+  if (image === null) return null
+  return { attachmentId: image.attachmentId, mediaType: image.mediaType, bytes: image.bytes, width: image.width, height: image.height }
+}
+
+function imageBlock(image: TapScreenshot): ContentBlock {
+  const ref: ImageAttachmentRef = {
+    attachmentId: image.attachmentId as unknown as ImageAttachmentRef['attachmentId'],
+    mediaType: image.mediaType as ImageAttachmentRef['mediaType'],
+    bytes: image.bytes,
+    width: image.width,
+    height: image.height,
+  }
+  return { type: 'image', attachment: ref }
+}
+
 function renderTap(_args: unknown, value: unknown): ContentBlock[] {
   const v = value as TapResult
   const lines = [
-    `Tap at image (${v.x}, ${v.y}) → device (${v.device_x}, ${v.device_y}) on ${v.serial}: ${v.action} ×${v.times}` +
-      (v.duration_ms > 0 ? ` (${v.duration_ms}ms)` : ''),
+    `Tap at (${v.x}, ${v.y}) on ${v.serial}: ${v.action} x${v.times}` + (v.duration_ms > 0 ? ` (${v.duration_ms}ms)` : '') + '.',
+    'Coordinates are screenshot pixels (device pixels): the marker shows where the tap landed on the grid.',
+    frameLine('Pre-tap frame (tap marker drawn)', v.pre_tap_screenshot, v.pre_saved_path),
+    frameLine('Post-tap frame', v.post_tap_screenshot, v.post_saved_path),
+    `Images emitted to model: ${v.screenshot_emitted ? 'yes' : 'no'}.`,
   ]
-  if (v.pre_tap_screenshot !== null) {
-    lines.push(`Pre-tap screenshot (annotated with tap position marker): ${v.pre_tap_screenshot.width}x${v.pre_tap_screenshot.height} px, ${v.pre_tap_screenshot.bytes} bytes.`)
-  } else {
-    lines.push('No pre-tap screenshot (attachment store unavailable or capture failed).')
-  }
-  if (v.post_tap_screenshot !== null) {
-    lines.push(`Post-tap screenshot (showing the screen result after tap): ${v.post_tap_screenshot.width}x${v.post_tap_screenshot.height} px, ${v.post_tap_screenshot.bytes} bytes.`)
-  } else {
-    lines.push('No post-tap screenshot (attachment store unavailable or capture failed).')
-  }
-  lines.push(`Images emitted to model: ${v.screenshot_emitted ? 'yes' : 'no'}.`)
-  const text = lines.join('\n')
-
-  const blocks: ContentBlock[] = [{ type: 'text', text }]
-
+  const blocks: ContentBlock[] = [{ type: 'text', text: lines.join('\n') }]
   if (v.screenshot_emitted) {
     if (v.pre_tap_screenshot !== null) {
-      blocks.push({ type: 'text', text: 'Pre-tap screenshot (annotated with tap position marker):' })
-      blocks.push({
-        type: 'image',
-        attachment: {
-          attachmentId: v.pre_tap_screenshot.attachmentId as unknown as ImageAttachmentRef['attachmentId'],
-          mediaType: v.pre_tap_screenshot.mediaType ?? 'image/png',
-          bytes: v.pre_tap_screenshot.bytes,
-          width: v.pre_tap_screenshot.width,
-          height: v.pre_tap_screenshot.height,
-        },
-      })
+      blocks.push({ type: 'text', text: 'Pre-tap frame (tap marker drawn):' })
+      blocks.push(imageBlock(v.pre_tap_screenshot))
     }
     if (v.post_tap_screenshot !== null) {
-      blocks.push({ type: 'text', text: 'Post-tap screenshot (showing the screen result after tap):' })
-      blocks.push({
-        type: 'image',
-        attachment: {
-          attachmentId: v.post_tap_screenshot.attachmentId as unknown as ImageAttachmentRef['attachmentId'],
-          mediaType: v.post_tap_screenshot.mediaType ?? 'image/png',
-          bytes: v.post_tap_screenshot.bytes,
-          width: v.post_tap_screenshot.width,
-          height: v.post_tap_screenshot.height,
-        },
-      })
+      blocks.push({ type: 'text', text: 'Post-tap frame (screen after the tap):' })
+      blocks.push(imageBlock(v.post_tap_screenshot))
     }
   }
-
   return blocks
 }
 
 function renderSwipe(value: SwipeResult): string {
-  return `Swipe image (${value.x1}, ${value.y1}) → (${value.x2}, ${value.y2})` +
-    ` / device (${value.device_x1}, ${value.device_y1}) → (${value.device_x2}, ${value.device_y2})` +
-    ` on ${value.serial}` + (value.duration_ms > 0 ? ` over ${value.duration_ms}ms` : '')
+  return `Swipe (${value.x1}, ${value.y1}) -> (${value.x2}, ${value.y2}) on ${value.serial}`
+    + (value.duration_ms > 0 ? ` over ${value.duration_ms}ms` : '')
+    + '. Coordinates are screenshot pixels (device pixels).'
 }
 
 function renderPressKey(value: PressKeyResult): string {
-  return `Pressed key "${value.key}" (keycode ${value.keycode}) on ${value.serial} ×${value.times}`
+  return `Pressed key "${value.key}" (keycode ${value.keycode}) on ${value.serial} x${value.times}`
 }
 
 function renderInputText(value: InputTextResult): string {
@@ -192,33 +189,28 @@ function textRender(fn: (value: never) => string): (args: unknown, value: unknow
   return (_args, value) => [{ type: 'text', text: fn(value as never) }]
 }
 
-/** Register `android_tap`, `android_swipe`, `android_press_key`, `android_input_text`. */
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+/** Register android_tap, android_swipe, android_press_key, android_input_text. */
 export function registerInputTools(ctx: Context, deps: ToolDeps): void {
   ctx.tools.register(defineTool({
     name: 'android_tap',
     description:
-      'Tap a point on the Android screen. Pass (x, y) in screenshot image '
-      + 'coordinates — the same coordinate space as the pixels in android_screenshot '
-      + 'and the "center" values from android_ui_dump. The plugin automatically '
-      + 'converts these to device-native coordinates for execution. '
-      + 'Use `duration_ms` for a long-press (hold). Use `times` to repeat the tap. '
-      + 'A pre-tap screenshot annotated with a marker at the tap position is captured '
-      + 'and returned when an attachment store is available.',
+      'Tap a point on the Android screen, in screenshot pixels (device pixels) — the numbers printed on an android_screenshot grid label. '
+      + 'Read the coordinate from the grid rather than estimating pixel positions, and prefer android_screenshot(region, magnify) to pin a small target before tapping. '
+      + 'Use duration_ms for a long-press (hold) and times to repeat the tap. '
+      + 'The result carries a marked pre-tap frame and a post-tap frame so the landed point and the screen change are both visible; both are compressed and retained on disk.',
     parameters: {
-      x: { type: 'integer', required: true, description: 'X coordinate in screenshot image space.' },
-      y: { type: 'integer', required: true, description: 'Y coordinate in screenshot image space.' },
+      x: { type: 'integer', required: true, description: 'X in screenshot pixels (device pixels), e.g. a grid label.' },
+      y: { type: 'integer', required: true, description: 'Y in screenshot pixels (device pixels).' },
       duration_ms: {
         type: 'integer',
         description: 'Hold duration in milliseconds. When > 0, performs a long-press (swipe-to-same-point) instead of a quick tap.',
       },
-      times: {
-        type: 'integer',
-        description: 'Number of times to repeat the tap (default 1).',
-      },
-      serial: {
-        type: 'string',
-        description: 'Device serial. Omit when only one device is attached; required when multiple are connected.',
-      },
+      times: { type: 'integer', description: 'Number of times to repeat the tap (default 1).' },
+      serial: { type: 'string', description: 'Device serial. Omit when only one device is attached; required when multiple are connected.' },
     },
     output: {
       schema: {
@@ -267,6 +259,8 @@ export function registerInputTools(ctx: Context, deps: ToolDeps): void {
             ],
             required: true,
           },
+          pre_saved_path: { oneOf: [{ type: 'null' }, { type: 'string' }], required: true },
+          post_saved_path: { oneOf: [{ type: 'null' }, { type: 'string' }], required: true },
           screenshot_emitted: { type: 'boolean', required: true },
         },
       },
@@ -279,103 +273,79 @@ export function registerInputTools(ctx: Context, deps: ToolDeps): void {
       const dur = typeof a.duration_ms === 'number' && a.duration_ms > 0 ? a.duration_ms : 0
       const times = typeof a.times === 'number' && a.times > 0 ? a.times : 1
       const action: 'tap' | 'long_press' = dur > 0 ? 'long_press' : 'tap'
+      let preSaved: string | null = null
+      let postSaved: string | null = null
 
-      let preScreenshot: TapScreenshot | null = null
-      let postScreenshot: TapScreenshot | null = null
-      let screenshotEmitted = false
-
-      const attachments = ctx.get('attachments') as import('@deepseek-ai/dsh-attachment').AttachmentStore | undefined
-
-      let scaleX = 1
-      let scaleY = 1
-
-      // Capture pre-tap screenshot (annotated with tap marker)
-      if (attachments !== undefined) {
-        try {
-          const raw = await deps.adb.execOutBinary(serial, 'screencap -p', exec.signal)
-          const fitted = await fitToMaxDimension(new Uint8Array(raw), attachments.imageLimits.maxImageDimension)
-          scaleX = fitted.scaleX
-          scaleY = fitted.scaleY
-          const annotated = await annotateTap(fitted.data, a.x, a.y)
-          const ref = await attachments.saveImage({
-            data: annotated.data,
-            mediaType: 'image/png',
-            name: 'pre_tap_screenshot.png',
-          })
-          preScreenshot = {
-            attachmentId: ref.attachmentId as unknown as string,
-            mediaType: ref.mediaType,
-            bytes: ref.bytes,
-            width: ref.width,
-            height: ref.height,
-          }
-        } catch {
-          // Pre-tap screenshot is best-effort; the tap itself must still proceed.
-        }
+      let pre: Frame | null = null
+      try {
+        pre = await captureFrame(ctx, deps, {
+          serial,
+          kind: 'pre-tap',
+          tap: { x: a.x, y: a.y },
+          note: `tap (${a.x}, ${a.y})`,
+          signal: exec.signal,
+        })
+        preSaved = pre.savedPath
+      } catch {
+        // A pre-tap frame is best effort: the tap itself must still happen.
       }
-
-      // Convert image-space coordinates to device-space for adb input.
-      const deviceX = Math.round(a.x / scaleX)
-      const deviceY = Math.round(a.y / scaleY)
 
       for (let i = 0; i < times; i++) {
         if (dur > 0) {
-          await deps.adb.shell(serial, `input swipe ${deviceX} ${deviceY} ${deviceX} ${deviceY} ${dur}`, exec.signal)
+          await deps.adb.shell(serial, `input swipe ${a.x} ${a.y} ${a.x} ${a.y} ${dur}`, exec.signal)
         } else {
-          await deps.adb.shell(serial, `input tap ${deviceX} ${deviceY}`, exec.signal)
+          await deps.adb.shell(serial, `input tap ${a.x} ${a.y}`, exec.signal)
         }
       }
 
-      // Capture post-tap screenshot (plain, no annotation) after a short delay
-      // to let UI animations settle.
-      if (attachments !== undefined) {
-        try {
-          await new Promise(resolve => setTimeout(resolve, 500))
-          const raw = await deps.adb.execOutBinary(serial, 'screencap -p', exec.signal)
-          const fitted = await fitToMaxDimension(new Uint8Array(raw), attachments.imageLimits.maxImageDimension)
-          const ref = await attachments.saveImage({
-            data: fitted.data,
-            mediaType: 'image/png',
-            name: 'post_tap_screenshot.png',
-          })
-          postScreenshot = {
-            attachmentId: ref.attachmentId as unknown as string,
-            mediaType: ref.mediaType,
-            bytes: ref.bytes,
-            width: ref.width,
-            height: ref.height,
-          }
-          screenshotEmitted = await routeIsImageCapable(ctx, exec, exec.signal)
-        } catch {
-          // Post-tap screenshot is best-effort.
-        }
+      let post: Frame | null = null
+      try {
+        await sleep(500)
+        post = await captureFrame(ctx, deps, {
+          serial,
+          kind: 'post-tap',
+          note: `after tap (${a.x}, ${a.y})`,
+          signal: exec.signal,
+        })
+        postSaved = post.savedPath
+      } catch {
+        // A post-tap frame is best effort.
       }
 
-      return { serial, x: a.x, y: a.y, device_x: deviceX, device_y: deviceY, duration_ms: dur, times, action, pre_tap_screenshot: preScreenshot, post_tap_screenshot: postScreenshot, screenshot_emitted: screenshotEmitted } satisfies TapResult
+      const hasImage = (pre?.image ?? null) !== null || (post?.image ?? null) !== null
+      const emitted = hasImage && await routeIsImageCapable(ctx, exec, exec.signal)
+
+      return {
+        serial,
+        x: a.x,
+        y: a.y,
+        device_x: a.x,
+        device_y: a.y,
+        duration_ms: dur,
+        times,
+        action,
+        pre_tap_screenshot: toRef(pre?.image ?? null),
+        post_tap_screenshot: toRef(post?.image ?? null),
+        pre_saved_path: preSaved,
+        post_saved_path: postSaved,
+        screenshot_emitted: emitted,
+      } satisfies TapResult
     },
   }))
 
   ctx.tools.register(defineTool({
     name: 'android_swipe',
     description:
-      'Swipe from one point to another on the Android screen. Pass start and end '
-      + 'coordinates in screenshot image space (the same coordinate space as '
-      + 'android_screenshot and android_ui_dump). The plugin automatically converts '
-      + 'these to device-native coordinates for execution. '
-      + 'Use `duration_ms` to control swipe speed (longer = slower).',
+      'Swipe or scroll from one point to another, in screenshot pixels (device pixels) — the numbers printed on an android_screenshot grid label. '
+      + 'A vertical swipe scrolls a list: e.g. (540, 1800) -> (540, 900) scrolls down one screen. '
+      + 'Use duration_ms to control speed (longer = slower, default 300).',
     parameters: {
-      x1: { type: 'integer', required: true, description: 'Start X coordinate in screenshot image space.' },
-      y1: { type: 'integer', required: true, description: 'Start Y coordinate in screenshot image space.' },
-      x2: { type: 'integer', required: true, description: 'End X coordinate in screenshot image space.' },
-      y2: { type: 'integer', required: true, description: 'End Y coordinate in screenshot image space.' },
-      duration_ms: {
-        type: 'integer',
-        description: 'Swipe duration in milliseconds (default 300). Longer values produce slower swipes.',
-      },
-      serial: {
-        type: 'string',
-        description: 'Device serial. Omit when only one device is attached; required when multiple are connected.',
-      },
+      x1: { type: 'integer', required: true, description: 'Start X in screenshot pixels.' },
+      y1: { type: 'integer', required: true, description: 'Start Y in screenshot pixels.' },
+      x2: { type: 'integer', required: true, description: 'End X in screenshot pixels.' },
+      y2: { type: 'integer', required: true, description: 'End Y in screenshot pixels.' },
+      duration_ms: { type: 'integer', description: 'Swipe duration in milliseconds (default 300). Longer values produce slower swipes.' },
+      serial: { type: 'string', description: 'Device serial. Omit when only one device is attached; required when multiple are connected.' },
     },
     output: {
       schema: {
@@ -402,22 +372,9 @@ export function registerInputTools(ctx: Context, deps: ToolDeps): void {
       const { serial } = await resolveSerial(deps.adb, a.serial, config.defaultSerial, exec.signal)
       const dur = typeof a.duration_ms === 'number' && a.duration_ms > 0 ? a.duration_ms : 300
 
-      const attachments = ctx.get('attachments') as import('@deepseek-ai/dsh-attachment').AttachmentStore | undefined
-      let scale = 1
-      if (attachments !== undefined) {
-        const sizeOutput = await deps.adb.shell(serial, 'wm size', exec.signal)
-        const { width: devW, height: devH } = parseWmSize(sizeOutput)
-        scale = computeScale(devW, devH, attachments.imageLimits.maxImageDimension)
-      }
+      await deps.adb.shell(serial, `input swipe ${a.x1} ${a.y1} ${a.x2} ${a.y2} ${dur}`, exec.signal)
 
-      const dx1 = Math.round(a.x1 / scale)
-      const dy1 = Math.round(a.y1 / scale)
-      const dx2 = Math.round(a.x2 / scale)
-      const dy2 = Math.round(a.y2 / scale)
-
-      await deps.adb.shell(serial, `input swipe ${dx1} ${dy1} ${dx2} ${dy2} ${dur}`, exec.signal)
-
-      return { serial, x1: a.x1, y1: a.y1, x2: a.x2, y2: a.y2, device_x1: dx1, device_y1: dy1, device_x2: dx2, device_y2: dy2, duration_ms: dur } satisfies SwipeResult
+      return { serial, x1: a.x1, y1: a.y1, x2: a.x2, y2: a.y2, device_x1: a.x1, device_y1: a.y1, device_x2: a.x2, device_y2: a.y2, duration_ms: dur } satisfies SwipeResult
     },
   }))
 
@@ -438,14 +395,8 @@ export function registerInputTools(ctx: Context, deps: ToolDeps): void {
         required: true,
         description: 'Key to press: a named key or a raw integer keycode.',
       },
-      times: {
-        type: 'integer',
-        description: 'Number of times to repeat the key press (default 1).',
-      },
-      serial: {
-        type: 'string',
-        description: 'Device serial. Omit when only one device is attached; required when multiple are connected.',
-      },
+      times: { type: 'integer', description: 'Number of times to repeat the key press (default 1).' },
+      serial: { type: 'string', description: 'Device serial. Omit when only one device is attached; required when multiple are connected.' },
     },
     output: {
       schema: {
@@ -485,14 +436,8 @@ export function registerInputTools(ctx: Context, deps: ToolDeps): void {
       + 'installed on the device). Pass `submit: true` to press Enter after typing.',
     parameters: {
       text: { type: 'string', required: true, description: 'Text to type into the focused field.' },
-      submit: {
-        type: 'boolean',
-        description: 'When true, presses Enter (keycode 66) after typing the text.',
-      },
-      serial: {
-        type: 'string',
-        description: 'Device serial. Omit when only one device is attached; required when multiple are connected.',
-      },
+      submit: { type: 'boolean', description: 'When true, presses Enter (keycode 66) after typing the text.' },
+      serial: { type: 'string', description: 'Device serial. Omit when only one device is attached; required when multiple are connected.' },
     },
     output: {
       schema: {
