@@ -11,13 +11,11 @@
  */
 
 import { useEffect, useState } from 'react'
-import type { ToolCallViewProps } from '@deepseek-ai/dsh-client-ui-tool/client'
+import type { StartedToolCallViewProps, ToolCallViewProps } from '@deepseek-ai/dsh-client-ui-tool/client'
 import type { MessageImageLoader, ToolResultNode } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { ContentBlock, ImageBlock } from '@deepseek-ai/dsh-llm'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import css from './TapCard.module.css'
-
-type TapCardProps = ToolCallViewProps
 
 /** Extract all image blocks from a settled tool result, in order. */
 function findImages(block: ToolResultNode): ImageBlock[] {
@@ -68,10 +66,41 @@ function useImageUrl(
 
 /**
  * Render one `android_tap` tool call as a card with pre-tap and post-tap screenshots.
+ *
+ * `tool.call.toolview` is a three-phase union: a `preparing` call carries no
+ * dispatched arguments, so it renders a lightweight argument-free row and the
+ * start/result phases delegate to {@link StartedTapCard} (which reads
+ * `argsRaw` only when the phase guarantees it).
  */
-export function TapCard({ block, toolName, loadImage }: TapCardProps) {
-  const settled = 'kind' in block ? block : undefined
-  const running = 'kind' in block ? undefined : block
+export function TapCard(props: ToolCallViewProps) {
+  if (props.phase === 'preparing') {
+    return (
+      <div className={css.card} data-tool={props.toolName} data-state="preparing">
+        <div className={css.header}>
+          <span className={css.stateDot} aria-hidden />
+          <span className={css.title}>{props.toolName}</span>
+          <span className={css.badge}>preparing</span>
+        </div>
+        <div className={css.imageGrid}>
+          <div className={css.imageSlot}>
+            <span className={css.imageLabel}>Pre-tap (annotated)</span>
+            <div className={css.imageWrap}><span className={css.placeholder}>Capturing…</span></div>
+          </div>
+          <div className={css.imageSlot}>
+            <span className={css.imageLabel}>Post-tap (result)</span>
+            <div className={css.imageWrap}><span className={css.placeholder}>Capturing…</span></div>
+          </div>
+        </div>
+      </div>
+    )
+  }
+  return <StartedTapCard {...props} />
+}
+
+/** Dispatched/settled `android_tap` card. */
+function StartedTapCard({ phase, block, toolName, loadImage }: StartedToolCallViewProps) {
+  const settled = phase === 'result' ? block : undefined
+  const running = phase === 'start' ? block : undefined
 
   const images = settled !== undefined ? findImages(settled) : []
   const text = settled !== undefined ? findText(settled) : undefined

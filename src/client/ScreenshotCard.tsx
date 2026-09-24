@@ -9,13 +9,11 @@
  */
 
 import { useEffect, useState } from 'react'
-import type { ToolCallViewProps } from '@deepseek-ai/dsh-client-ui-tool/client'
+import type { StartedToolCallViewProps, ToolCallViewProps } from '@deepseek-ai/dsh-client-ui-tool/client'
 import type { MessageImageLoader, ToolResultNode } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { ContentBlock, ImageBlock } from '@deepseek-ai/dsh-llm'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import css from './ScreenshotCard.module.css'
-
-type ScreenshotCardProps = ToolCallViewProps
 
 function findImage(block: ToolResultNode): ImageBlock | undefined {
   return block.content.find((c): c is ImageBlock => c.type === 'image')
@@ -47,9 +45,32 @@ function useImageUrl(
 
 /**
  * Render one `android_screenshot` tool call as a card with the screenshot.
+ *
+ * `tool.call.toolview` is a three-phase union: a `preparing` call carries no
+ * dispatched arguments, so it renders a lightweight argument-free row and the
+ * start/result phases delegate to {@link StartedScreenshotCard}.
  */
-export function ScreenshotCard({ block, toolName, loadImage }: ScreenshotCardProps) {
-  const settled = 'kind' in block ? block : undefined
+export function ScreenshotCard(props: ToolCallViewProps) {
+  if (props.phase === 'preparing') {
+    return (
+      <div className={css.card} data-tool={props.toolName} data-state="preparing">
+        <div className={css.header}>
+          <span className={css.stateDot} aria-hidden />
+          <span className={css.title}>{props.toolName}</span>
+          <span className={css.badge}>preparing</span>
+        </div>
+        <div className={css.imageWrap}>
+          <span className={css.placeholder}>Capturing…</span>
+        </div>
+      </div>
+    )
+  }
+  return <StartedScreenshotCard {...props} />
+}
+
+/** Dispatched/settled `android_screenshot` card. */
+function StartedScreenshotCard({ phase, block, toolName, loadImage }: StartedToolCallViewProps) {
+  const settled = phase === 'result' ? block : undefined
 
   const image = settled !== undefined ? findImage(settled) : undefined
   const text = settled !== undefined ? findText(settled) : undefined

@@ -13,7 +13,7 @@
  * @module @huanlin/dsh-plugin-android-use
  */
 
-import z from 'schemastery'
+import z from '@deepseek-ai/schemastery'
 import type { Context } from '@deepseek-ai/cordis'
 import { AdbClient } from './adb.js'
 import { defaultCaptureDir } from './capture.js'
