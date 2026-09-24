@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Android Use",
+    "description": "adb-based tools that let the model operate an Android phone on its own: device discovery, screenshots burned with a tap-ready coordinate grid, accessibility-tree dumps, tap/swipe/text/key input, and app launching — every coordinate is read straight off the grid, no scaling math."
+  }
+}

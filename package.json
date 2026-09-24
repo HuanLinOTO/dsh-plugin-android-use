@@ -1,6 +1,6 @@
 {
   "name": "@huanlin/dsh-plugin-android-use",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "publishConfig": {
     "access": "public"
   },
@@ -20,6 +20,7 @@
     "./client": {
       "default": "./lib/client.js"
     },
+    "./locale/*.json": "./locale/*.json",
     "./package.json": "./package.json"
   },
   "files": [
@@ -28,7 +29,8 @@
     "lib/client.js",
     "lib/client.js.map",
     "cordis.patch.yml",
-    "skills/"
+    "skills/",
+    "locale/"
   ],
   "dsh": {
     "bundle": {
